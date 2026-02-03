@@ -207,6 +207,7 @@ git checkout 5088921
 npm install
 pear run . <store-name>
 ```
+MSB uses the **npm** `trac-wallet@0.0.43-msb-r2.8` package for wallet/keypair handling.
 
 ### How to use the MSB CLI for transfers
 1) Use the **same wallet keypair** as your peer by copying `keypair.json` into the MSB store’s `db` folder.  
