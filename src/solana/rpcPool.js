@@ -14,10 +14,12 @@ function splitCsv(raw) {
 function fetchWithTimeout(timeoutMs) {
   const baseFetch = globalThis.fetch;
   if (typeof baseFetch !== 'function') return undefined;
+  const Controller = globalThis.AbortController;
+  if (typeof Controller !== 'function') return baseFetch;
   const ms = Number.isFinite(timeoutMs) ? Math.max(250, Math.trunc(timeoutMs)) : 8000;
 
   return async (input, init = {}) => {
-    const controller = new AbortController();
+    const controller = new Controller();
     const timer = setTimeout(() => controller.abort(), ms);
     try {
       const mergedInit = { ...init, signal: controller.signal };
@@ -84,4 +86,3 @@ export class SolanaRpcPool {
     throw lastErr || new Error(`${label} failed`);
   }
 }
-

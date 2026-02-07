@@ -1,15 +1,20 @@
 export async function fetchJson(url, { timeoutMs = 4000, headers = {} } = {}) {
-  const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), Math.max(1, timeoutMs));
-  try {
-    const res = await fetch(url, {
+  const baseFetch = globalThis.fetch;
+  if (typeof baseFetch !== 'function') throw new Error('fetch is not available');
+
+  const ms = Math.max(1, Number.isFinite(timeoutMs) ? Math.trunc(timeoutMs) : 4000);
+  const Controller = globalThis.AbortController;
+
+  const doFetch = async (signal) => {
+    const init = {
       method: 'GET',
       headers: {
         accept: 'application/json',
         ...headers,
       },
-      signal: controller.signal,
-    });
+      ...(signal ? { signal } : {}),
+    };
+    const res = await baseFetch(url, init);
     const text = await res.text();
     if (!res.ok) {
       const err = new Error(`HTTP ${res.status}`);
@@ -24,8 +29,22 @@ export async function fetchJson(url, { timeoutMs = 4000, headers = {} } = {}) {
       err.body = text.slice(0, 200);
       throw err;
     }
+  };
+
+  // Pear/Bare runtimes may not provide AbortController. Fall back to a
+  // Promise.race timeout in that case (cannot abort the underlying fetch).
+  if (typeof Controller !== 'function') {
+    const timeout = new Promise((_resolve, reject) => {
+      setTimeout(() => reject(new Error(`timeout after ${ms}ms`)), ms);
+    });
+    return Promise.race([doFetch(null), timeout]);
+  }
+
+  const controller = new Controller();
+  const timer = setTimeout(() => controller.abort(), ms);
+  try {
+    return await doFetch(controller.signal);
   } finally {
     clearTimeout(timer);
   }
 }
-
