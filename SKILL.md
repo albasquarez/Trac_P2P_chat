@@ -1,6 +1,9 @@
 ---
 name: intercomswap
-description: "Install and operate Intercom Swap: a fork of Intercom (upstream: https://github.com/Trac-Systems/intercom) that negotiates P2P request-for-quote (RFQ) swaps over Intercom sidechannels and settles BTC(LN) <> USDT(Solana) via a shared Solana escrow program, with deterministic operator tooling, recovery, and unattended e2e tests."
+description: |
+  Install and operate Intercom Swap: a fork of Intercom that negotiates P2P RFQ swaps over sidechannels
+  and settles BTC over Lightning <> USDT on Solana via a shared escrow program, with deterministic operator tooling,
+  recovery, and unattended end-to-end tests.
 ---
 
 # Intercom Swap
@@ -161,6 +164,53 @@ For tool-call friendly lifecycle control (start/stop/restart specific bot instan
 To avoid copy/pasting SC-Bridge URLs/tokens, use the wrappers that read the token from `onchain/sc-bridge/<store>.token`:
 - `scripts/swapctl-peer.sh <storeName> <scBridgePort> ...`
 - `scripts/swapctl-peer.ps1 <storeName> <scBridgePort> ...`
+
+## Optional Prompt Router (promptd)
+This repo also includes an optional **prompt router + tool executor** layer (`promptd`) so an agent (or UI) can:
+- send a high-level prompt to an OpenAI-compatible model endpoint
+- receive **tool calls** only (no arbitrary shell execution)
+- execute those tool calls via the existing deterministic scripts/SC‑Bridge RPCs
+- keep secrets out of the model context by using opaque `secret:<id>` handles
+
+### Prompt Setup Location (Gitignored JSON)
+Prompt configuration is **not** done via environment variables. It is loaded from a local JSON file:
+- default: `onchain/prompt/setup.json` (gitignored via `onchain/`)
+
+Generate a template:
+```bash
+./scripts/promptd.sh --print-template > onchain/prompt/setup.json
+```
+Windows:
+```powershell
+.\scripts\promptd.ps1 --print-template | Out-File -Encoding utf8 onchain\prompt\setup.json
+```
+
+Edit `onchain/prompt/setup.json`:
+- `llm.base_url`: your OpenAI-compatible REST API base (must end with `/v1` for most servers)
+- `llm.model`: model id to use
+- `llm.api_key`: optional (use `""` if not required)
+- `sc_bridge.token` or `sc_bridge.token_file`: SC‑Bridge auth
+- optional: `receipts.db`, `ln.*`, `solana.*` (only needed for tools that touch those subsystems)
+
+Run `promptd`:
+```bash
+./scripts/promptd.sh --config onchain/prompt/setup.json
+```
+
+Run prompts with `promptctl`:
+```bash
+./scripts/promptctl.sh --prompt "Show SC-Bridge info"
+./scripts/promptctl.sh --dry-run 1 --auto-approve 0 --prompt "Post an RFQ in 0000intercomswapbtcusdt"
+```
+
+### Secret Handles (No Leaks To The Model)
+Tool outputs may contain sensitive material (LN preimages, swap invites/welcomes). `promptd` will:
+- store those values server-side in the current session
+- replace them with `secret:<id>` handles before they are sent to the model
+- allow later tool calls to pass those handles back (the executor resolves them)
+
+If `promptd` restarts (or you lose the session), secret handles become invalid. For real ops, always enable receipts (`receipts.db`) so recovery tooling can be used.
+
 ## Quick Start (Clone + Run)
 Use Pear runtime only (never native node).
 

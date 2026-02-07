@@ -568,7 +568,7 @@ This is only for running LND from a local directory under `onchain/` (not requir
 
 ## Prompt Router (Optional)
 
-This repo includes an optional local prompting layer that:
+This repo includes an optional **prompt router + tool executor** (`promptd`) that:
 - calls an OpenAI-compatible LLM endpoint
 - executes *only* the safe tool surface (SC-Bridge safe RPC + deterministic scripts)
 - writes an audit trail under `onchain/`
@@ -576,7 +576,8 @@ This repo includes an optional local prompting layer that:
 
 ### Setup (JSON, Gitignored)
 
-All prompt configuration lives in a local JSON file (recommended path: `onchain/prompt/setup.json`), which is gitignored by default.
+All prompt configuration lives in a local JSON file (recommended path: `onchain/prompt/setup.json`), which is gitignored by default.  
+No environment variables are required for `promptd` configuration.
 
 Generate a template:
 ```bash
@@ -584,7 +585,10 @@ Generate a template:
 ```
 
 Edit `onchain/prompt/setup.json`:
-- `llm.base_url`, `llm.model` (and optional sampling params)
+- `llm.base_url`: your OpenAI-compatible REST API base (typically ends with `/v1`)
+- `llm.model`: model id to use
+- `llm.api_key`: optional (use `""` if not required)
+- optional sampling params: `max_tokens`, `temperature`, `top_p`, `top_k`, `min_p`, `repetition_penalty`
 - `sc_bridge.token` or `sc_bridge.token_file`
 - `receipts.db` (optional, for `intercomswap_receipts_*` tools)
 - `ln.*`, `solana.*` (optional, depending on which tools you want enabled)
@@ -599,6 +603,10 @@ Run prompts:
 ./scripts/promptctl.sh --prompt "Show SC-Bridge info"
 ./scripts/promptctl.sh --auto-approve 1 --prompt "Post an RFQ in 0000intercomswapbtcusdt"
 ```
+
+### Secret Handles (No Leaks To The Model)
+
+Some tool outputs are sensitive (LN preimages, swap invites/welcomes). `promptd` will replace these values with `secret:<id>` handles before sending tool results back to the model. Later tool calls can pass those handles back, and the executor will resolve them server-side.
 
 ---
 
