@@ -735,6 +735,285 @@ export class ToolExecutor {
       };
     }
 
+    if (toolName === 'intercomswap_stack_start') {
+      assertAllowedKeys(args, toolName, ['peer_name', 'peer_store', 'sc_port', 'sidechannels', 'ln_bootstrap', 'sol_bootstrap']);
+      requireApproval(toolName, autoApprove);
+
+      const inferScPort = () => {
+        try {
+          const u = new URL(String(this.scBridge?.url || '').trim());
+          const p = u.port ? Number.parseInt(u.port, 10) : 0;
+          return Number.isFinite(p) && p > 0 ? p : 49222;
+        } catch (_e) {
+          return 49222;
+        }
+      };
+
+      const scPort = 'sc_port' in args ? expectInt(args, toolName, 'sc_port', { min: 1, max: 65535 }) : inferScPort();
+      const peerNameArg = expectOptionalString(args, toolName, 'peer_name', { min: 1, max: 64, pattern: /^[A-Za-z0-9._-]+$/ });
+      const peerStoreArg = expectOptionalString(args, toolName, 'peer_store', { min: 1, max: 64, pattern: /^[A-Za-z0-9._-]+$/ });
+
+      const sidechannels = Array.isArray(args.sidechannels) ? args.sidechannels.map(normalizeChannelName) : [];
+      if (sidechannels.length > 50) throw new Error(`${toolName}: sidechannels too long`);
+
+      const lnBootstrap = 'ln_bootstrap' in args ? expectBool(args, toolName, 'ln_bootstrap') : true;
+      const solBootstrap = 'sol_bootstrap' in args ? expectBool(args, toolName, 'sol_bootstrap') : true;
+
+      const waitForFile = async (p, { timeoutMs = 10_000 } = {}) => {
+        const deadline = Date.now() + timeoutMs;
+        // eslint-disable-next-line no-constant-condition
+        while (true) {
+          try {
+            if (fs.existsSync(p)) return true;
+          } catch (_e) {}
+          if (Date.now() >= deadline) return false;
+          await new Promise((r) => setTimeout(r, 120));
+        }
+      };
+
+      if (dryRun) {
+        return {
+          type: 'dry_run',
+          tool: toolName,
+          peer_name: peerNameArg || null,
+          peer_store: peerStoreArg || null,
+          sc_port: scPort,
+          sidechannels,
+          ln_bootstrap: lnBootstrap,
+          sol_bootstrap: solBootstrap,
+        };
+      }
+
+      const { peerStatus, peerStart } = await import('../peer/peerManager.js');
+      const status = peerStatus({ repoRoot: process.cwd(), name: '' });
+      const aliveMatch =
+        Array.isArray(status?.peers) ? status.peers.find((p) => p?.alive && Number(p?.sc_bridge?.port) === scPort) : null;
+
+      let peerOut = null;
+      let peerName = peerNameArg || '';
+      let peerStore = peerStoreArg || '';
+
+      if (aliveMatch) {
+        peerName = String(aliveMatch?.name || '').trim();
+        peerStore = String(aliveMatch?.store || '').trim();
+        peerOut = { type: 'peer_already_running', name: peerName, store: peerStore, pid: aliveMatch.pid || null, log: aliveMatch.log || null };
+      } else {
+        // Heuristic defaults: derive store from receipts db basename if possible.
+        if (!peerStore) {
+          try {
+            const receiptsDb = String(this.receipts?.dbPath || '').trim();
+            const base = receiptsDb ? path.basename(receiptsDb).replace(/\.(sqlite|db)$/i, '') : '';
+            if (base && /^[A-Za-z0-9._-]+$/.test(base)) peerStore = base;
+          } catch (_e) {}
+        }
+        if (!peerStore) peerStore = 'swap-maker';
+        if (!peerName) peerName = `${peerStore}-peer`;
+
+        // If no sidechannels provided, use a sane default rendezvous.
+        const peerSidechannels = sidechannels.length > 0 ? sidechannels : ['0000intercomswapbtcusdt'];
+
+        peerOut = await peerStart({
+          repoRoot: process.cwd(),
+          name: peerName,
+          store: peerStore,
+          scPort,
+          sidechannels: peerSidechannels,
+          sidechannelInviterKeys: [],
+          dhtBootstrap: [],
+          msbDhtBootstrap: [],
+          subnetChannel: '',
+          msbEnabled: false,
+          priceOracleEnabled: false,
+          sidechannelPowEnabled: true,
+          sidechannelPowDifficulty: 12,
+          sidechannelWelcomeRequired: false,
+          sidechannelInviteRequired: true,
+          sidechannelInvitePrefixes: ['swap:'],
+          logPath: '',
+          readyTimeoutMs: 20_000,
+        });
+      }
+
+      // Ensure promptd is wired for peer signing (required for RFQ/offer/etc).
+      const inferredKeypair = path.join(process.cwd(), 'stores', peerStore, 'db', 'keypair.json');
+      if (!this.peer) this.peer = { keypairPath: inferredKeypair };
+      if (!String(this.peer.keypairPath || '').trim()) this.peer.keypairPath = inferredKeypair;
+      this._peerSigning = null;
+
+      let keypairOk = await waitForFile(inferredKeypair, { timeoutMs: 15_000 });
+      if (!keypairOk && aliveMatch) {
+        // If the peer was already running but the keypair file is missing, restart it so index.js
+        // can regenerate/export the keypair file.
+        const { peerStop } = await import('../peer/peerManager.js');
+        try {
+          await peerStop({ repoRoot: process.cwd(), name: peerName, signal: 'SIGTERM', waitMs: 4000 });
+        } catch (_e) {}
+        peerOut = await peerStart({
+          repoRoot: process.cwd(),
+          name: peerName,
+          store: peerStore,
+          scPort,
+          sidechannels: sidechannels.length > 0 ? sidechannels : Array.isArray(aliveMatch?.args?.sidechannels) ? aliveMatch.args.sidechannels : ['0000intercomswapbtcusdt'],
+          sidechannelInviterKeys: Array.isArray(aliveMatch?.args?.sidechannel_inviter_keys) ? aliveMatch.args.sidechannel_inviter_keys : [],
+          dhtBootstrap: Array.isArray(aliveMatch?.args?.dht_bootstrap) ? aliveMatch.args.dht_bootstrap : [],
+          msbDhtBootstrap: Array.isArray(aliveMatch?.args?.msb_dht_bootstrap) ? aliveMatch.args.msb_dht_bootstrap : [],
+          subnetChannel: String(aliveMatch?.args?.subnet_channel || '').trim(),
+          msbEnabled: Boolean(aliveMatch?.args?.msb),
+          priceOracleEnabled: Boolean(aliveMatch?.args?.price_oracle),
+          sidechannelPowEnabled: Boolean(aliveMatch?.args?.sidechannel_pow),
+          sidechannelPowDifficulty: Number.isInteger(aliveMatch?.args?.sidechannel_pow_difficulty) ? aliveMatch.args.sidechannel_pow_difficulty : 12,
+          sidechannelWelcomeRequired: Boolean(aliveMatch?.args?.sidechannel_welcome_required),
+          sidechannelInviteRequired: Boolean(aliveMatch?.args?.sidechannel_invite_required),
+          sidechannelInvitePrefixes: Array.isArray(aliveMatch?.args?.sidechannel_invite_prefixes) ? aliveMatch.args.sidechannel_invite_prefixes : ['swap:'],
+          logPath: '',
+          readyTimeoutMs: 20_000,
+        });
+        keypairOk = await waitForFile(inferredKeypair, { timeoutMs: 15_000 });
+      }
+      if (!keypairOk) throw new Error(`peer keypair not found after start: ${inferredKeypair}`);
+
+      // Ensure SC-Bridge is reachable (so the UI stream can connect immediately).
+      await this.scEnsureConnected({ timeoutMs: 10_000 });
+
+      // Ensure receipts DB is writable (recovery trail).
+      const receiptsStore = await this._openReceiptsStore({ required: true });
+      try {
+        // No-op read to force sqlite init + schema creation.
+        await receiptsStore.listTradesPaged({ limit: 1, offset: 0 });
+      } finally {
+        receiptsStore.close();
+      }
+
+      // Ensure Lightning readiness (regtest docker can be fully bootstrapped automatically).
+      let lnOut = null;
+      let lnErr = null;
+      try {
+        const funds = await lnListFunds(this.ln);
+        const channels = Array.isArray(funds?.channels) ? funds.channels : Array.isArray(funds?.channels?.channels) ? funds.channels.channels : [];
+        const channelCount = Array.isArray(channels) ? channels.length : 0;
+        if (lnBootstrap && String(this.ln?.backend || '').trim() === 'docker' && String(this.ln?.network || '').trim().toLowerCase() === 'regtest') {
+          if (channelCount > 0) {
+            lnOut = { type: 'ln_ready', channels: channelCount };
+          } else {
+            lnOut = await this.execute('intercomswap_ln_regtest_init', {}, { autoApprove: true, dryRun: false, secrets });
+          }
+        } else {
+          lnOut = { type: 'ln_status', channels: channelCount };
+        }
+      } catch (err) {
+        lnErr = err?.message ?? String(err);
+        if (lnBootstrap && String(this.ln?.backend || '').trim() === 'docker' && String(this.ln?.network || '').trim().toLowerCase() === 'regtest') {
+          lnOut = await this.execute('intercomswap_ln_regtest_init', {}, { autoApprove: true, dryRun: false, secrets });
+          lnErr = null;
+        }
+      }
+
+      // Ensure Solana readiness (local validator bootstrap).
+      let solOut = null;
+      let solErr = null;
+      try {
+        const urls = String(this.solana?.rpcUrls || '').trim();
+        const isLocal = urls.includes('127.0.0.1') || urls.includes('localhost');
+        if (solBootstrap && isLocal) {
+          solOut = await this.execute('intercomswap_sol_local_start', {}, { autoApprove: true, dryRun: false, secrets });
+        }
+        // Confirm the program config PDA is readable (signals RPC+program loaded).
+        await this.execute('intercomswap_sol_config_get', {}, { autoApprove: false, dryRun: false, secrets });
+      } catch (err) {
+        solErr = err?.message ?? String(err);
+      }
+
+      return {
+        type: 'stack_started',
+        peer: peerOut,
+        peer_keypair: inferredKeypair,
+        ln: lnOut,
+        ln_error: lnErr,
+        solana: solOut,
+        solana_error: solErr,
+      };
+    }
+
+    if (toolName === 'intercomswap_stack_stop') {
+      assertAllowedKeys(args, toolName, ['peer_name', 'sc_port', 'ln_stop', 'sol_stop']);
+      requireApproval(toolName, autoApprove);
+
+      const inferScPort = () => {
+        try {
+          const u = new URL(String(this.scBridge?.url || '').trim());
+          const p = u.port ? Number.parseInt(u.port, 10) : 0;
+          return Number.isFinite(p) && p > 0 ? p : 49222;
+        } catch (_e) {
+          return 49222;
+        }
+      };
+      const scPort = 'sc_port' in args ? expectInt(args, toolName, 'sc_port', { min: 1, max: 65535 }) : inferScPort();
+      const peerNameArg = expectOptionalString(args, toolName, 'peer_name', { min: 1, max: 64, pattern: /^[A-Za-z0-9._-]+$/ });
+      const lnStop = 'ln_stop' in args ? expectBool(args, toolName, 'ln_stop') : true;
+      const solStop = 'sol_stop' in args ? expectBool(args, toolName, 'sol_stop') : true;
+
+      if (dryRun) {
+        return {
+          type: 'dry_run',
+          tool: toolName,
+          peer_name: peerNameArg || null,
+          sc_port: scPort,
+          ln_stop: lnStop,
+          sol_stop: solStop,
+        };
+      }
+
+      // Best-effort close the persistent SC session so the UI stream fails fast instead of hanging.
+      try {
+        if (this._sc) this._sc.close();
+      } catch (_e) {}
+      this._sc = null;
+      this._scConnecting = null;
+
+      const { peerStatus, peerStop } = await import('../peer/peerManager.js');
+      const status = peerStatus({ repoRoot: process.cwd(), name: '' });
+      const aliveMatch =
+        Array.isArray(status?.peers) ? status.peers.find((p) => p?.alive && Number(p?.sc_bridge?.port) === scPort) : null;
+      const peerName = peerNameArg || (aliveMatch ? String(aliveMatch?.name || '').trim() : '');
+
+      let peerOut = null;
+      if (peerName) {
+        peerOut = await peerStop({ repoRoot: process.cwd(), name: peerName, signal: 'SIGTERM', waitMs: 4000 });
+      } else {
+        peerOut = { type: 'peer_stop_skipped', reason: 'no_peer_found_for_sc_port', sc_port: scPort };
+      }
+
+      let lnOut = null;
+      if (lnStop && String(this.ln?.backend || '').trim() === 'docker') {
+        try {
+          lnOut = await this.execute('intercomswap_ln_docker_down', { volumes: false }, { autoApprove: true, dryRun: false, secrets });
+        } catch (err) {
+          lnOut = { type: 'ln_docker_down_error', error: err?.message ?? String(err) };
+        }
+      } else {
+        lnOut = { type: 'ln_stop_skipped' };
+      }
+
+      let solOut = null;
+      if (solStop) {
+        const urls = String(this.solana?.rpcUrls || '').trim();
+        const isLocal = urls.includes('127.0.0.1') || urls.includes('localhost');
+        if (isLocal) {
+          try {
+            solOut = await this.execute('intercomswap_sol_local_stop', {}, { autoApprove: true, dryRun: false, secrets });
+          } catch (err) {
+            solOut = { type: 'sol_local_stop_error', error: err?.message ?? String(err) };
+          }
+        } else {
+          solOut = { type: 'sol_stop_skipped', reason: 'rpc_not_local' };
+        }
+      } else {
+        solOut = { type: 'sol_stop_skipped' };
+      }
+
+      return { type: 'stack_stopped', peer: peerOut, ln: lnOut, solana: solOut };
+    }
+
     // Read-only SC-Bridge
     if (toolName === 'intercomswap_sc_info') {
       assertAllowedKeys(args, toolName, []);
@@ -1951,6 +2230,244 @@ export class ToolExecutor {
         volumes,
         stdout: String(out.stdout || '').trim() || null,
         stderr: String(out.stderr || '').trim() || null,
+      };
+    }
+
+    if (toolName === 'intercomswap_ln_regtest_init') {
+      assertAllowedKeys(args, toolName, [
+        'compose_file',
+        'from_service',
+        'to_service',
+        'channel_amount_sats',
+        'fund_btc',
+        'mine_initial_blocks',
+        'mine_confirm_blocks',
+      ]);
+      requireApproval(toolName, autoApprove);
+
+      if (String(this.ln?.backend || '').trim() !== 'docker') {
+        throw new Error(`${toolName}: ln.backend must be "docker"`);
+      }
+      const netRaw = String(this.ln?.network || '').trim().toLowerCase();
+      if (netRaw !== 'regtest' && netRaw !== 'reg') {
+        throw new Error(`${toolName}: ln.network must be "regtest" (got ${netRaw || 'unset'})`);
+      }
+
+      const impl = String(this.ln?.impl || '').trim() || 'cln';
+      if (!['cln', 'lnd'].includes(impl)) {
+        throw new Error(`${toolName}: ln.impl must be cln|lnd (got ${impl || 'unset'})`);
+      }
+
+      const composeFileRaw = args.compose_file ? String(args.compose_file).trim() : String(this.ln?.composeFile || '').trim();
+      if (!composeFileRaw) throw new Error(`${toolName}: missing compose file (ln.compose_file)`);
+      const composeFile = resolveWithinRepoRoot(composeFileRaw, { label: 'compose_file', mustExist: true });
+
+      const channelAmountSats = expectOptionalInt(args, toolName, 'channel_amount_sats', { min: 10_000, max: 10_000_000_000 }) ?? 1_000_000;
+      const fundBtc = args.fund_btc !== undefined && args.fund_btc !== null ? String(args.fund_btc).trim() : '1';
+      if (!/^[0-9]+(?:\\.[0-9]{1,8})?$/.test(fundBtc)) throw new Error(`${toolName}: fund_btc must be a BTC decimal string`);
+      const mineInitialBlocks = expectOptionalInt(args, toolName, 'mine_initial_blocks', { min: 1, max: 500 }) ?? 101;
+      const mineConfirmBlocks = expectOptionalInt(args, toolName, 'mine_confirm_blocks', { min: 1, max: 100 }) ?? 6;
+
+      const defaultAlice = impl === 'lnd' ? 'lnd-alice' : 'cln-alice';
+      const defaultBob = impl === 'lnd' ? 'lnd-bob' : 'cln-bob';
+      const fromSvcRaw =
+        args.from_service !== undefined && args.from_service !== null
+          ? String(args.from_service).trim()
+          : String(this.ln?.service || '').trim() || defaultBob;
+      const fromService = normalizeDockerServiceName(fromSvcRaw, 'from_service');
+      let toSvcRaw = args.to_service !== undefined && args.to_service !== null ? String(args.to_service).trim() : '';
+      if (!toSvcRaw) {
+        if (fromService === defaultBob) toSvcRaw = defaultAlice;
+        else if (fromService === defaultAlice) toSvcRaw = defaultBob;
+        else {
+          throw new Error(`${toolName}: to_service is required when from_service is not ${defaultAlice} or ${defaultBob}`);
+        }
+      }
+      const toService = normalizeDockerServiceName(toSvcRaw, 'to_service');
+      if (toService === fromService) throw new Error(`${toolName}: from_service and to_service must differ`);
+
+      const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+      const retry = async (fn, { tries = 120, delayMs = 500, label = 'retry' } = {}) => {
+        let lastErr = null;
+        for (let i = 0; i < tries; i += 1) {
+          try {
+            return await fn();
+          } catch (err) {
+            lastErr = err;
+            await sleep(delayMs);
+          }
+        }
+        throw new Error(`${label} failed after ${tries} tries: ${lastErr?.message ?? String(lastErr)}`);
+      };
+
+      const parseJsonOrText = (text) => {
+        const s = String(text || '').trim();
+        if (!s) return { result: '' };
+        try {
+          return JSON.parse(s);
+        } catch (_e) {
+          return { result: s };
+        }
+      };
+
+      const btcCli = async (extraArgs) => {
+        const out = await dockerCompose({
+          composeFile,
+          args: [
+            'exec',
+            '-T',
+            'bitcoind',
+            'bitcoin-cli',
+            '-regtest',
+            '-rpcuser=rpcuser',
+            '-rpcpassword=rpcpass',
+            '-rpcport=18443',
+            ...extraArgs,
+          ],
+          cwd: process.cwd(),
+        });
+        return parseJsonOrText(out.stdout);
+      };
+
+      const clnCli = async (service, extraArgs) => {
+        const out = await dockerCompose({
+          composeFile,
+          args: ['exec', '-T', service, 'lightning-cli', '--network=regtest', ...extraArgs],
+          cwd: process.cwd(),
+        });
+        return parseJsonOrText(out.stdout);
+      };
+
+      // Compose up (idempotent).
+      if (dryRun) {
+        return {
+          type: 'dry_run',
+          tool: toolName,
+          compose_file: composeFile,
+          impl,
+          from_service: fromService,
+          to_service: toService,
+          channel_amount_sats: channelAmountSats,
+          fund_btc: fundBtc,
+          mine_initial_blocks: mineInitialBlocks,
+          mine_confirm_blocks: mineConfirmBlocks,
+        };
+      }
+
+      await dockerCompose({
+        composeFile,
+        args: ['up', '-d', '--remove-orphans', 'bitcoind', fromService, toService],
+        cwd: process.cwd(),
+      });
+
+      await retry(() => btcCli(['getblockchaininfo']), { label: 'bitcoind ready', tries: 120, delayMs: 500 });
+
+      const baseLnCfg = { ...this.ln, backend: 'docker', network: 'regtest', impl, composeFile, cwd: process.cwd() };
+      const fromCfg = { ...baseLnCfg, service: fromService };
+      const toCfg = { ...baseLnCfg, service: toService };
+
+      await retry(() => lnGetInfo(fromCfg), { label: `${fromService} ready`, tries: 120, delayMs: 500 });
+      await retry(() => lnGetInfo(toCfg), { label: `${toService} ready`, tries: 120, delayMs: 500 });
+
+      if (impl === 'lnd') {
+        await retry(async () => {
+          const info = await lnGetInfo(fromCfg);
+          if (!info?.synced_to_chain) throw new Error('from node not synced_to_chain');
+          return info;
+        }, { label: `${fromService} synced`, tries: 200, delayMs: 250 });
+        await retry(async () => {
+          const info = await lnGetInfo(toCfg);
+          if (!info?.synced_to_chain) throw new Error('to node not synced_to_chain');
+          return info;
+        }, { label: `${toService} synced`, tries: 200, delayMs: 250 });
+      }
+
+      // Miner wallet + spendable coins.
+      try {
+        await btcCli(['createwallet', 'miner']);
+      } catch (_e) {}
+      const minerAddr = (await btcCli(['-rpcwallet=miner', 'getnewaddress']))?.result;
+      if (!minerAddr) throw new Error(`${toolName}: miner getnewaddress failed`);
+      await btcCli(['-rpcwallet=miner', 'generatetoaddress', String(mineInitialBlocks), minerAddr]);
+
+      // Fund both LN nodes.
+      const fromAddr = (await lnNewAddress(fromCfg))?.address;
+      const toAddr = (await lnNewAddress(toCfg))?.address;
+      if (!fromAddr || !toAddr) throw new Error(`${toolName}: ln_newaddr failed`);
+      await btcCli(['-rpcwallet=miner', 'sendtoaddress', String(fromAddr), fundBtc]);
+      await btcCli(['-rpcwallet=miner', 'sendtoaddress', String(toAddr), fundBtc]);
+      await btcCli(['-rpcwallet=miner', 'generatetoaddress', String(mineConfirmBlocks), minerAddr]);
+
+      const hasConfirmedUtxo = (funds) => {
+        const outs = Array.isArray(funds?.outputs) ? funds.outputs : [];
+        return outs.some((o) => String(o?.status || '').toLowerCase() === 'confirmed');
+      };
+      const hasConfirmedBalance = (wb) => {
+        const n = wb?.confirmed_balance ?? wb?.confirmedBalance ?? null;
+        try {
+          return n !== null && n !== undefined && BigInt(String(n)) > 0n;
+        } catch (_e) {
+          return false;
+        }
+      };
+
+      await retry(async () => {
+        const funds = await lnListFunds(fromCfg);
+        if (impl === 'cln') {
+          if (!hasConfirmedUtxo(funds)) throw new Error('from node not funded yet');
+        } else {
+          if (!hasConfirmedBalance(funds?.wallet)) throw new Error('from node not funded yet');
+        }
+        return funds;
+      }, { label: `${fromService} funded`, tries: 160, delayMs: 250 });
+
+      await retry(async () => {
+        const funds = await lnListFunds(toCfg);
+        if (impl === 'cln') {
+          if (!hasConfirmedUtxo(funds)) throw new Error('to node not funded yet');
+        } else {
+          if (!hasConfirmedBalance(funds?.wallet)) throw new Error('to node not funded yet');
+        }
+        return funds;
+      }, { label: `${toService} funded`, tries: 160, delayMs: 250 });
+
+      // Connect + open channel (from -> to).
+      const toInfo = await lnGetInfo(toCfg);
+      const toNodeId = String(toInfo?.id || toInfo?.identity_pubkey || '').trim();
+      if (!/^[0-9a-fA-F]{66}$/.test(toNodeId)) throw new Error(`${toolName}: to node id invalid/missing`);
+      await lnConnect(fromCfg, { peer: `${toNodeId}@${toService}:9735` });
+      await lnFundChannel(fromCfg, { nodeId: toNodeId, amountSats: channelAmountSats, block: false });
+      await btcCli(['-rpcwallet=miner', 'generatetoaddress', String(mineConfirmBlocks), minerAddr]);
+
+      await retry(async () => {
+        if (impl === 'cln') {
+          const chans = await clnCli(fromService, ['listpeerchannels']);
+          const c = Array.isArray(chans?.channels) ? chans.channels.find((x) => x?.peer_id === toNodeId) : null;
+          const st = String(c?.state || '');
+          if (st !== 'CHANNELD_NORMAL') throw new Error(`channel state=${st || 'unknown'}`);
+          return chans;
+        }
+        const funds = await lnListFunds(fromCfg);
+        const chans = funds?.channels;
+        const arr = chans && typeof chans === 'object' && Array.isArray(chans.channels) ? chans.channels : [];
+        const c = arr.find((x) => String(x?.remote_pubkey || '').trim() === toNodeId) || null;
+        if (!c) throw new Error('channel not found yet');
+        if (!c.active) throw new Error('channel not active yet');
+        return funds;
+      }, { label: 'channel active', tries: 200, delayMs: 250 });
+
+      return {
+        type: 'ln_regtest_init',
+        compose_file: composeFile,
+        impl,
+        from_service: fromService,
+        to_service: toService,
+        channel_amount_sats: channelAmountSats,
+        fund_btc: fundBtc,
+        miner_addr: minerAddr,
+        from_address: String(fromAddr),
+        to_address: String(toAddr),
+        to_node_id: toNodeId.toLowerCase(),
       };
     }
 

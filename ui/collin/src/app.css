@@ -378,6 +378,10 @@
   background: linear-gradient(135deg, rgba(34, 211, 238, 0.30), rgba(132, 204, 22, 0.18));
   border-color: rgba(34, 211, 238, 0.34);
 }
+.btn.danger {
+  background: linear-gradient(135deg, rgba(244, 63, 94, 0.32), rgba(249, 115, 22, 0.14));
+  border-color: rgba(244, 63, 94, 0.34);
+}
 .btn.small {
   padding: 7px 10px;
   font-size: 12px;

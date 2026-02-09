@@ -714,6 +714,15 @@ This repo includes **Collin**, a local-first control center UI (prompting is onl
 Important: Collin’s live sidechannel stream (`/v1/sc/stream`) requires a **running peer with SC-Bridge enabled**.
 Start a peer first (or start it from Collin via the `peer_*` tools once `promptd` is running).
 
+Collin also enforces a hard **STACK READY** gate for trade tools (RFQ/Offer/Bots/Swap protocol):
+- peer + SC-Bridge running
+- `sc/stream` connected
+- Lightning has **at least one channel**
+- Solana signer + program config reachable
+- receipts DB configured (for recovery)
+
+For docker regtest, Collin includes a one-click Lightning bootstrap (`intercomswap_ln_regtest_init`) that mines, funds both LN nodes, and opens a channel.
+
 Examples:
 ```bash
 # Background peer (recommended; doesn’t require keeping a terminal open)

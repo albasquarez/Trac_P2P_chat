@@ -64,6 +64,46 @@ export const INTERCOMSWAP_TOOLS = [
     'Get local environment/config summary (LN network, Solana RPC, receipts DB path). Does not touch the network.',
     emptyParams
   ),
+  tool(
+    'intercomswap_stack_start',
+    'Start/bootstrap the local stack (peer + SC-Bridge, LN regtest channel on docker, Solana local validator, receipts DB).',
+    {
+      type: 'object',
+      additionalProperties: false,
+      properties: {
+        // Peer + SC-Bridge
+        peer_name: { type: 'string', minLength: 1, maxLength: 64, pattern: '^[A-Za-z0-9._-]+$' },
+        peer_store: { type: 'string', minLength: 1, maxLength: 64, pattern: '^[A-Za-z0-9._-]+$' },
+        sc_port: { type: 'integer', minimum: 1, maximum: 65535 },
+        sidechannels: {
+          type: 'array',
+          minItems: 0,
+          maxItems: 50,
+          items: channelParam,
+          description: 'Sidechannels to join on startup (rendezvous).',
+        },
+        // LN + Solana
+        ln_bootstrap: { type: 'boolean', description: 'If true, ensure LN readiness (docker+regtest: fund + open channel if needed).' },
+        sol_bootstrap: { type: 'boolean', description: 'If true, ensure Solana readiness (localhost: start validator if needed).' },
+      },
+      required: [],
+    }
+  ),
+  tool(
+    'intercomswap_stack_stop',
+    'Stop the local stack (peer + Solana local validator + LN docker). Does not delete state.',
+    {
+      type: 'object',
+      additionalProperties: false,
+      properties: {
+        peer_name: { type: 'string', minLength: 1, maxLength: 64, pattern: '^[A-Za-z0-9._-]+$' },
+        sc_port: { type: 'integer', minimum: 1, maximum: 65535 },
+        ln_stop: { type: 'boolean', description: 'If true and ln.backend=docker, stop the docker compose stack.' },
+        sol_stop: { type: 'boolean', description: 'If true and Solana is localhost, stop the managed local validator.' },
+      },
+      required: [],
+    }
+  ),
   // SC-Bridge safe RPCs (no CLI mirroring).
   tool('intercomswap_sc_info', 'Get peer info via SC-Bridge (safe fields only).', emptyParams),
   tool('intercomswap_sc_stats', 'Get SC-Bridge stats.', emptyParams),
@@ -612,6 +652,31 @@ export const INTERCOMSWAP_TOOLS = [
     },
     required: [],
   }),
+  tool(
+    'intercomswap_ln_regtest_init',
+    'Docker-only (regtest): bootstrap a funded Lightning channel between the two nodes in the compose stack (mine, fund, connect, open channel).',
+    {
+      type: 'object',
+      additionalProperties: false,
+      properties: {
+        // Optional override (must be within repo root).
+        compose_file: { type: 'string', minLength: 1, maxLength: 400, pattern: '^[^\\s]+$' },
+        from_service: { type: 'string', minLength: 1, maxLength: 64, pattern: '^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$' },
+        to_service: { type: 'string', minLength: 1, maxLength: 64, pattern: '^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$' },
+        channel_amount_sats: { type: 'integer', minimum: 10_000, maximum: 10_000_000_000, description: 'Channel capacity in sats (default 1,000,000).' },
+        fund_btc: {
+          type: 'string',
+          minLength: 1,
+          maxLength: 32,
+          pattern: '^[0-9]+(?:\\.[0-9]{1,8})?$',
+          description: 'BTC amount to send to each LN node wallet (default "1").',
+        },
+        mine_initial_blocks: { type: 'integer', minimum: 1, maximum: 500, description: 'Initial blocks to mine for spendable coins (default 101).' },
+        mine_confirm_blocks: { type: 'integer', minimum: 1, maximum: 100, description: 'Blocks to mine for confirmations (default 6).' },
+      },
+      required: [],
+    }
+  ),
   tool('intercomswap_ln_info', 'Get Lightning node info (impl/backend configured locally).', emptyParams),
   tool('intercomswap_ln_newaddr', 'Get a new on-chain BTC address from the LN node wallet.', emptyParams),
   tool('intercomswap_ln_listfunds', 'Get on-chain + channel balances.', emptyParams),

@@ -42,6 +42,7 @@ function App() {
 
   const [runBusy, setRunBusy] = useState(false);
   const [runErr, setRunErr] = useState<string | null>(null);
+  const [stackOpBusy, setStackOpBusy] = useState(false);
   const [consoleEvents, setConsoleEvents] = useState<any[]>([]);
   const consoleEventsMax = 500;
   const consoleListRef = useRef<HTMLDivElement | null>(null);
@@ -52,6 +53,17 @@ function App() {
   const [envInfo, setEnvInfo] = useState<any>(null);
   const [envBusy, setEnvBusy] = useState(false);
   const [envErr, setEnvErr] = useState<string | null>(null);
+
+  // Human-friendly funding helpers (so operators don’t have to fish JSON out of logs).
+  const [lnFundingAddr, setLnFundingAddr] = useState<string | null>(null);
+  const [lnFundingAddrErr, setLnFundingAddrErr] = useState<string | null>(null);
+  const [solBalance, setSolBalance] = useState<any>(null);
+  const [solBalanceErr, setSolBalanceErr] = useState<string | null>(null);
+
+  const [lnPeerInput, setLnPeerInput] = useState<string>('');
+  const [lnChannelNodeId, setLnChannelNodeId] = useState<string>('');
+  const [lnChannelAmountSats, setLnChannelAmountSats] = useState<number>(1_000_000);
+  const [lnChannelPrivate, setLnChannelPrivate] = useState<boolean>(true);
 
   // Local receipts-driven views (paginated; memory-safe).
   const [trades, setTrades] = useState<any[]>([]);
@@ -336,6 +348,64 @@ function App() {
     return out;
   }, [tools, toolFilter]);
 
+  const stackGate = useMemo(() => {
+    const reasons: string[] = [];
+    const okPromptd = Boolean(health?.ok);
+    if (!okPromptd) reasons.push('promptd offline');
+
+    const okChecklist = Boolean(preflight && typeof preflight === 'object');
+    if (!okChecklist) reasons.push('checklist not run');
+
+    const okPeer = Boolean(preflight?.peer_status?.peers?.some?.((p: any) => Boolean(p?.alive)));
+    if (okChecklist && !okPeer) reasons.push('peer not running');
+
+    const okStream = Boolean(scConnected);
+    if (okChecklist && !okStream) reasons.push('sc/stream not connected');
+
+    const okLn =
+      Boolean(preflight?.ln_summary?.channels && Number(preflight.ln_summary.channels) > 0) &&
+      !preflight?.ln_listfunds_error;
+    if (okChecklist && !okLn) reasons.push('Lightning not ready (no channels)');
+
+    const solKind = String(preflight?.env?.solana?.classify?.kind || envInfo?.solana?.classify?.kind || '');
+    const okSolRpc = solKind !== 'local' || Boolean(preflight?.sol_local_status?.rpc_listening);
+    const okSolSigner = Boolean(preflight?.sol_signer?.pubkey) && !preflight?.sol_signer_error;
+    const okSolConfig = !preflight?.sol_config_error;
+    const okSol = okSolRpc && okSolSigner && okSolConfig;
+    if (okChecklist && !okSol) reasons.push('Solana not ready');
+
+    const okReceipts = !preflight?.receipts_error;
+    if (okChecklist && !okReceipts) reasons.push('receipts not ready');
+
+    const okApp = Boolean(preflight?.app?.app_hash) && !preflight?.app_error;
+    if (okChecklist && !okApp) reasons.push('app binding missing');
+
+    return {
+      ok: okPromptd && okChecklist && okPeer && okStream && okLn && okSol && okReceipts && okApp,
+      reasons,
+      okPromptd,
+      okChecklist,
+      okPeer,
+      okStream,
+      okLn,
+      okSol,
+      okReceipts,
+      okApp,
+    };
+  }, [health, preflight, scConnected, envInfo]);
+
+  const stackAnyRunning = useMemo(() => {
+    try {
+      const peerUp = Boolean(preflight?.peer_status?.peers?.some?.((p: any) => Boolean(p?.alive)));
+      const solUp = Boolean(preflight?.sol_local_status?.alive) || Boolean(preflight?.sol_local_status?.rpc_listening);
+      const dockerUp = Array.isArray(preflight?.ln_docker_ps?.services) && preflight.ln_docker_ps.services.length > 0;
+      const lnUp = Boolean(preflight?.ln_summary?.channels && Number(preflight.ln_summary.channels) > 0) || dockerUp;
+      return peerUp || solUp || lnUp;
+    } catch (_e) {
+      return false;
+    }
+  }, [preflight]);
+
   async function fetchJson(path: string, init?: RequestInit) {
     const res = await fetch(path, {
       ...init,
@@ -372,6 +442,64 @@ function App() {
       }
     }
     return out;
+  }
+
+  async function stackStart() {
+    if (stackOpBusy) return;
+    setStackOpBusy(true);
+    setRunErr(null);
+    try {
+      const sidechannels = scChannels
+        .split(',')
+        .map((s) => s.trim())
+        .filter(Boolean)
+        .slice(0, 50);
+
+      setRunMode('tool');
+      setToolName('intercomswap_stack_start');
+      setToolArgsBoth({ sidechannels });
+      setPromptOpen(true);
+
+      await runPromptStream({
+        prompt: JSON.stringify({ type: 'tool', name: 'intercomswap_stack_start', arguments: { sidechannels } }),
+        session_id: sessionId,
+        auto_approve: true,
+        dry_run: false,
+      });
+
+      // Refresh status and auto-connect the sidechannel stream once SC-Bridge is up.
+      await refreshPreflight();
+      if (!scConnected) {
+        await new Promise((r) => setTimeout(r, 250));
+        void startScStream();
+      }
+    } finally {
+      setStackOpBusy(false);
+    }
+  }
+
+  async function stackStop() {
+    if (stackOpBusy) return;
+    setStackOpBusy(true);
+    setRunErr(null);
+    try {
+      stopScStream();
+
+      setRunMode('tool');
+      setToolName('intercomswap_stack_stop');
+      setToolArgsBoth({});
+      setPromptOpen(true);
+
+      await runPromptStream({
+        prompt: JSON.stringify({ type: 'tool', name: 'intercomswap_stack_stop', arguments: {} }),
+        session_id: sessionId,
+        auto_approve: true,
+        dry_run: false,
+      });
+      await refreshPreflight();
+    } finally {
+      setStackOpBusy(false);
+    }
   }
 
 	  function validateToolArgs(tool: any, args: any): string[] {
@@ -566,6 +694,12 @@ function App() {
     } catch (e: any) {
       out.app_error = e?.message || String(e);
     }
+    try {
+      // Ensure receipts DB is configured + writable early, so swaps always have a recovery trail.
+      out.receipts = await runDirectToolOnce('intercomswap_receipts_list', { limit: 1, offset: 0 }, { auto_approve: false });
+    } catch (e: any) {
+      out.receipts_error = e?.message || String(e);
+    }
 
     setPreflight(out);
     setPreflightBusy(false);
@@ -750,6 +884,15 @@ function App() {
     });
   }
 
+  async function copyToClipboard(label: string, value: any) {
+    const s = String(value ?? '').trim();
+    if (!s) return;
+    try {
+      await navigator.clipboard.writeText(s);
+      void appendPromptEvent({ type: 'ui', ts: Date.now(), message: `copied ${label}` }, { persist: false });
+    } catch (_e) {}
+  }
+
   function deriveKindTrade(msg: any) {
     if (!msg || typeof msg !== 'object') return { kind: '', trade_id: '' };
     const kind = typeof msg.kind === 'string' ? msg.kind : '';
@@ -842,6 +985,34 @@ function App() {
   }
 
   async function runPromptStream(payload: any) {
+    // Hard gate: never allow trade/protocol actions unless the full stack is up.
+    // This prevents operators from broadcasting RFQs/offers or starting bots when settlement isn’t possible.
+    try {
+      const promptStr = String(payload?.prompt || '').trim();
+      let toolName: string | null = null;
+      if (promptStr.startsWith('{')) {
+        try {
+          const obj: any = JSON.parse(promptStr);
+          if (obj && typeof obj === 'object' && String(obj.type || '') === 'tool' && typeof obj.name === 'string') {
+            toolName = String(obj.name).trim() || null;
+          }
+        } catch (_e) {}
+      }
+
+      const block =
+        (toolName && toolNeedsFullStack(toolName) && !stackGate.ok) ||
+        (!toolName && runMode === 'llm' && !stackGate.ok);
+
+      if (block) {
+        const missing = stackGate.reasons.length > 0 ? stackGate.reasons.map((r) => `- ${r}`).join('\n') : '- unknown';
+        const msg = `${toolName || 'prompt'}: blocked (stack not ready)\n\nMissing:\n${missing}\n\nGo to Overview -> Getting Started and complete the checklist.`;
+        setRunErr(msg);
+        setConsoleEvents([{ type: 'error', ts: Date.now(), error: msg }]);
+        void appendPromptEvent({ type: 'error', ts: Date.now(), error: msg }, { persist: false });
+        return;
+      }
+    } catch (_e) {}
+
     if (promptAbortRef.current) promptAbortRef.current.abort();
     const ac = new AbortController();
     promptAbortRef.current = ac;
@@ -982,6 +1153,7 @@ function App() {
     refreshHealth();
     refreshTools();
     void refreshEnv();
+    void refreshPreflight();
     const t = setInterval(refreshHealth, 5000);
     return () => clearInterval(t);
     // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -1083,6 +1255,12 @@ function App() {
     if (nearBottom && openClaimsHasMore && !openClaimsLoading) void loadOpenClaimsPage({ reset: false });
   };
 
+  const lnInfoObj = preflight?.ln_info && typeof preflight.ln_info === 'object' ? preflight.ln_info : null;
+  const lnAlias = lnInfoObj ? String((lnInfoObj as any).alias || '').trim() : '';
+  const lnNodeId = lnInfoObj ? String((lnInfoObj as any).id || (lnInfoObj as any).identity_pubkey || '').trim() : '';
+  const lnNodeIdShort = lnNodeId ? `${lnNodeId.slice(0, 16)}…` : '';
+  const solSignerPubkey = String(preflight?.sol_signer?.pubkey || '').trim();
+
   return (
     <div
       className={`shell ${promptOpen ? 'prompt-open' : 'prompt-closed'} ${navOpen ? 'nav-open' : 'nav-closed'} ${
@@ -1121,6 +1299,11 @@ function App() {
             />
             <StatusPill label="promptd" state={health?.ok ? 'ok' : 'bad'} />
             <StatusPill label="sc/stream" state={scConnected ? 'ok' : scStreamErr ? 'bad' : 'idle'} value={scStreamErr ? 'ERR' : ''} />
+            <StatusPill
+              label="stack"
+              state={!health?.ok ? 'bad' : !preflight ? 'idle' : stackGate.ok ? 'ok' : 'bad'}
+              value={!preflight ? 'CHECK' : stackGate.ok ? 'READY' : 'BLOCK'}
+            />
             <StatusPill label="run" state={runBusy ? 'neutral' : runErr ? 'bad' : 'idle'} value={runBusy ? 'RUNNING' : runErr ? 'ERR' : ''} />
             <StatusPill label="mode" state="neutral" value={runMode.toUpperCase()} />
             <span className="muted small">{health ? new Date(health.ts).toLocaleTimeString() : '...'}</span>
@@ -1135,6 +1318,14 @@ function App() {
           </div>
         </div>
         <div className="topbar-right">
+          <button
+            className={`btn ${stackAnyRunning ? 'danger' : 'primary'}`}
+            onClick={stackAnyRunning ? stackStop : stackStart}
+            disabled={!health?.ok || stackOpBusy}
+            title={stackAnyRunning ? 'Stop peer + LN + Solana (local)' : 'Start peer + LN + Solana (bootstrap)'}
+          >
+            {stackOpBusy ? 'Busy…' : stackAnyRunning ? 'STOP' : 'START'}
+          </button>
           <button className="btn primary" onClick={() => setPromptOpen((v) => !v)}>
             {promptOpen ? 'Collapse' : 'Open'} console
           </button>
@@ -1171,20 +1362,23 @@ function App() {
       <main className="main">
         {activeTab === 'overview' ? (
           <div className="grid2">
-					<Panel title="Getting Started">
-						<p className="muted">
-							Linear checklist for posting RFQs and running swaps. Use the buttons to prepare tool calls (and run them
-							from the console).
-						</p>
-						<div className="alert warn">
-							Intercomswap assumes the <b>full stack</b> is running: peer+SC-Bridge, Lightning, Solana, and receipts.
-							Post RFQs only when you are ready to settle.
-						</div>
-					<div className="row">
-						<button className="btn primary" onClick={refreshPreflight} disabled={preflightBusy}>
-							{preflightBusy ? 'Checking…' : 'Refresh checklist'}
-						</button>
+            <Panel title="Stack">
+              <div className="alert warn">
+                Use <b>START</b> in the header to bring up everything needed to quote and settle swaps:
+                <span className="mono"> peer + sc/stream + Lightning + Solana + receipts</span>.
+              </div>
+
+              <div className="row">
+                <button className="btn primary" onClick={refreshPreflight} disabled={preflightBusy}>
+                  {preflightBusy ? 'Checking…' : 'Refresh status'}
+                </button>
                 {preflight?.ts ? <span className="muted small">last: {new Date(preflight.ts).toLocaleTimeString()}</span> : null}
+                <button className="btn" onClick={() => setActiveTab('wallets')}>
+                  Wallets
+                </button>
+                <button className="btn" onClick={() => setActiveTab('rendezvous')}>
+                  Rendezvous
+                </button>
               </div>
 
               <div className="field">
@@ -1228,420 +1422,106 @@ function App() {
                 </div>
               </div>
 
-						<div className="field">
-							<div className="field-hd">
-								<span className="mono">1) Peer + SC-Bridge</span>
-                  {preflight?.peer_status?.peers?.some?.((p: any) => p?.alive) ? (
-                    <span className="chip hi">running</span>
-                  ) : (
-                    <span className="chip">not running</span>
-                  )}
+              {!stackGate.ok ? (
+                <div className="alert bad">
+                  <b>STACK BLOCKED.</b> START/STOP will still run, but trade tools are blocked until these are green:
+                  <div className="muted small" style={{ marginTop: 6, whiteSpace: 'pre-wrap' }}>
+                    {stackGate.reasons.length > 0 ? stackGate.reasons.map((r) => `- ${r}`).join('\n') : '- unknown'}
+                  </div>
+                </div>
+              ) : (
+                <div className="muted small">
+                  <span className="chip hi">stack ready</span> RFQ/Offer/Bot tools are unlocked.
+                </div>
+              )}
+
+              <div className="field">
+                <div className="field-hd">
+                  <span className="mono">Rendezvous Channels</span>
+                  {scConnected ? <span className="chip hi">stream on</span> : <span className="chip">stream off</span>}
                 </div>
                 <div className="muted small">
-                  Collin’s live stream needs a peer with SC-Bridge enabled (default port <span className="mono">49222</span>).
+                  Comma-separated channels for discovery/negotiation. START joins these on the peer and auto-connects{' '}
+                  <span className="mono">sc/stream</span>.
                 </div>
-                {preflight?.peer_status_error ? <div className="alert bad">{String(preflight.peer_status_error)}</div> : null}
                 <div className="row">
-                  <button
-                    className="btn"
-                    onClick={() => {
-                      setToolInputMode('form');
-                      setToolArgsParseErr(null);
-                      setRunMode('tool');
-                      setToolName('intercomswap_peer_start');
-                      setToolArgsBoth({
-                        name: 'swap-maker-peer',
-                        store: 'swap-maker',
-                        sc_port: 49222,
-                        sidechannels: scChannels.split(',').map((s) => s.trim()).filter(Boolean),
-                        pow_enabled: true,
-                        pow_difficulty: 12,
-                        invite_required: true,
-                        welcome_required: false,
-                        invite_prefixes: ['swap:'],
-                      });
-                      setPromptOpen(true);
-                    }}
-                  >
-                    Prepare peer_start (swap-maker)
+                  <input className="input" value={scChannels} onChange={(e) => setScChannels(e.target.value)} placeholder="channels (csv)" />
+                </div>
+                {scStreamErr ? <div className="alert bad">sc/stream: {String(scStreamErr)}</div> : null}
+              </div>
+
+              <div className="field">
+                <div className="field-hd">
+                  <span className="mono">Funding + Channel Status</span>
+                </div>
+
+                <div className="muted small">
+                  You do <b>not</b> select an LN channel per trade. LN routing uses whatever channels your node has.
+                </div>
+
+                <div className="row">
+                  {preflight?.ln_summary?.channels > 0 ? (
+                    <span className="chip hi">{preflight.ln_summary.channels} LN channel(s)</span>
+                  ) : (
+                    <span className="chip warn">no LN channels</span>
+                  )}
+                  {String(envInfo?.ln?.backend || '') === 'docker' && String(envInfo?.ln?.network || '') === 'regtest' ? (
+                    <span className="chip hi">regtest auto-bootstrapped</span>
+                  ) : null}
+                </div>
+
+                <div className="row">
+                  <span className="tag">BTC</span>
+                  <input className="input mono" value={lnFundingAddr || ''} readOnly placeholder="Generate a BTC funding address…" />
+                  <button className="btn" disabled={!lnFundingAddr} onClick={() => copyToClipboard('btc address', lnFundingAddr)}>
+                    Copy
                   </button>
                   <button
                     className="btn primary"
-                    disabled={runBusy}
+                    disabled={runBusy || stackOpBusy}
                     onClick={async () => {
-                      const args = {
-                        name: 'swap-maker-peer',
-                        store: 'swap-maker',
-                        sc_port: 49222,
-                        sidechannels: scChannels.split(',').map((s) => s.trim()).filter(Boolean),
-                        pow_enabled: true,
-                        pow_difficulty: 12,
-                        invite_required: true,
-                        welcome_required: false,
-                        invite_prefixes: ['swap:'],
-                      };
-                      setToolInputMode('form');
-                      setToolArgsParseErr(null);
-                      setRunMode('tool');
-                      setToolName('intercomswap_peer_start');
-                      setToolArgsBoth(args);
-                      setPromptOpen(true);
-                      const ok =
-                        autoApprove ||
-                        window.confirm(
-                          `Start swap-maker peer now?\n\nThis will spawn a detached pear process using store "swap-maker" and SC-Bridge port 49222.`
-                        );
-                      if (!ok) return;
-                      await runPromptStream({
-                        prompt: JSON.stringify({ type: 'tool', name: 'intercomswap_peer_start', arguments: args }),
-                        session_id: sessionId,
-                        auto_approve: true,
-                        dry_run: false,
-                      });
+                      try {
+                        const out = await runDirectToolOnce('intercomswap_ln_newaddr', {}, { auto_approve: true });
+                        const addr = String(out?.address || '').trim();
+                        if (!addr) throw new Error('ln_newaddr returned no address');
+                        setLnFundingAddr(addr);
+                        setLnFundingAddrErr(null);
+                      } catch (e: any) {
+                        setLnFundingAddrErr(e?.message || String(e));
+                      }
                     }}
                   >
-                    Start peer now
+                    New BTC address
+                  </button>
+                </div>
+                {lnFundingAddrErr ? <div className="alert bad">{lnFundingAddrErr}</div> : null}
+
+                <div className="row">
+                  <span className="tag">SOL</span>
+                  <input className="input mono" value={solSignerPubkey || ''} readOnly placeholder="sol signer pubkey…" />
+                  <button className="btn" disabled={!solSignerPubkey} onClick={() => copyToClipboard('solana pubkey', solSignerPubkey)}>
+                    Copy
                   </button>
                   <button
                     className="btn"
-                    onClick={() => {
-                      setRunMode('tool');
-                      setToolName('intercomswap_peer_status');
-                      setToolArgsBoth({});
-                      setPromptOpen(true);
+                    disabled={runBusy || !solSignerPubkey}
+                    onClick={async () => {
+                      try {
+                        const lamports = await runDirectToolOnce('intercomswap_sol_balance', { pubkey: solSignerPubkey }, { auto_approve: false });
+                        setSolBalance(lamports);
+                        setSolBalanceErr(null);
+                      } catch (e: any) {
+                        setSolBalanceErr(e?.message || String(e));
+                      }
                     }}
                   >
-                    peer_status
+                    Refresh SOL
                   </button>
+                  {solBalance !== null && solBalance !== undefined ? (
+                    <span className="chip">{String(solBalance)} lamports</span>
+                  ) : null}
                 </div>
-						</div>
-
-						<div className="field">
-							<div className="field-hd">
-								<span className="mono">2) Sidechannel stream (recommended)</span>
-								{scConnected ? <span className="chip hi">connected</span> : <span className="chip">disconnected</span>}
-							</div>
-							{scStreamErr ? <div className="alert bad">{String(scStreamErr)}</div> : null}
-							{preflight?.sc_info_error ? <div className="alert bad">{String(preflight.sc_info_error)}</div> : null}
-							<div className="row">
-								{!scConnected ? (
-									<button className="btn primary" onClick={startScStream}>
-										Connect sc/stream
-                    </button>
-                  ) : (
-                    <button className="btn" onClick={stopScStream}>
-                      Stop sc/stream
-                    </button>
-                  )}
-                  <button
-                    className="btn"
-                    onClick={() => {
-                      const chans = scChannels.split(',').map((s) => s.trim()).filter(Boolean);
-                      if (chans.length === 0) return;
-                      setRunMode('tool');
-                      setToolName('intercomswap_sc_subscribe');
-                      setToolArgsBoth({ channels: chans });
-                      setPromptOpen(true);
-                    }}
-                  >
-                    Prepare subscribe
-                  </button>
-                </div>
-						</div>
-
-						<div className="field">
-							<div className="field-hd">
-								<span className="mono">3) Post an RFQ (request)</span>
-								<span className="chip">tool: rfq_post</span>
-							</div>
-							<div className="muted small">
-								This posts a <b>signed</b> RFQ envelope into the rendezvous channel.
-							</div>
-							<div className="row">
-								<button
-									className="btn"
-									onClick={() => {
-										const chans = scChannels.split(',').map((s) => s.trim()).filter(Boolean);
-										const rendezvous = chans[0] || '0000intercomswapbtcusdt';
-										const now = Date.now();
-										setToolInputMode('form');
-										setToolArgsParseErr(null);
-										setRunMode('tool');
-										setToolName('intercomswap_rfq_post');
-										setToolArgsBoth({
-											channel: rendezvous,
-											trade_id: `rfq-${now}`,
-											btc_sats: 10_000,
-											usdt_amount: '1000000',
-											max_platform_fee_bps: 50,
-											max_trade_fee_bps: 50,
-											max_total_fee_bps: 100,
-											min_sol_refund_window_sec: 72 * 3600,
-											max_sol_refund_window_sec: 7 * 24 * 3600,
-											valid_until_unix: Math.floor(now / 1000) + 10 * 60,
-										});
-										setPromptOpen(true);
-									}}
-								>
-									Prepare rfq_post
-								</button>
-								<button
-									className="btn primary"
-									disabled={runBusy}
-									onClick={async () => {
-										const chans = scChannels.split(',').map((s) => s.trim()).filter(Boolean);
-										const rendezvous = chans[0] || '0000intercomswapbtcusdt';
-										const now = Date.now();
-										const args = {
-											channel: rendezvous,
-											trade_id: `rfq-${now}`,
-											btc_sats: 10_000,
-											usdt_amount: '1000000',
-											max_platform_fee_bps: 50,
-											max_trade_fee_bps: 50,
-											max_total_fee_bps: 100,
-											min_sol_refund_window_sec: 72 * 3600,
-											max_sol_refund_window_sec: 7 * 24 * 3600,
-											valid_until_unix: Math.floor(now / 1000) + 10 * 60,
-										};
-										setToolInputMode('form');
-										setToolArgsParseErr(null);
-										setRunMode('tool');
-										setToolName('intercomswap_rfq_post');
-										setToolArgsBoth(args);
-										setPromptOpen(true);
-										const ok =
-											autoApprove ||
-											window.confirm(
-												`Post RFQ now?\n\nChannel: ${rendezvous}\nBTC: 0.00010000 (10,000 sats)\nUSDT: 1.0\nMax fees: 0.5% platform + 0.5% trade (1.0% total)`
-										);
-										if (!ok) return;
-										await runPromptStream({
-											prompt: JSON.stringify({ type: 'tool', name: 'intercomswap_rfq_post', arguments: args }),
-											session_id: sessionId,
-											auto_approve: true,
-											dry_run: false,
-										});
-									}}
-								>
-									Post RFQ now
-								</button>
-							</div>
-						</div>
-
-						<div className="field">
-							<div className="field-hd">
-								<span className="mono">4) Lightning readiness (settlement)</span>
-								{preflight?.ln_summary?.channels > 0 ? (
-									<span className="chip hi">{preflight.ln_summary.channels} channel(s)</span>
-								) : (
-									<span className="chip">no channels</span>
-								)}
-	                </div>
-		                <div className="muted small">
-		                  Swaps can route over the LN network, but you still need an LN node with funds and typically at least one channel for paying invoices.
-		                </div>
-		                {preflight?.ln_listfunds_error ? <div className="alert bad">{String(preflight.ln_listfunds_error)}</div> : null}
-		                {String(envInfo?.ln?.backend || '') === 'docker' ? (
-		                  <>
-		                    {preflight?.ln_docker_ps_error ? (
-		                      <div className="alert bad">docker: {String(preflight.ln_docker_ps_error)}</div>
-		                    ) : null}
-		                    {Array.isArray(preflight?.ln_docker_ps?.services) ? (
-		                      <div className="muted small">
-		                        docker:{' '}
-		                        {preflight.ln_docker_ps.services.length === 0
-		                          ? 'down'
-		                          : preflight.ln_docker_ps.services
-		                              .map((s: any) => `${String(s?.service || 'svc')}:${String(s?.state || 'unknown')}`)
-		                              .join(' · ')}
-		                      </div>
-		                    ) : null}
-		                  </>
-		                ) : null}
-		                <div className="row">
-		                  {String(envInfo?.ln?.backend || '') === 'docker' ? (
-		                    <>
-		                      <button
-	                        className="btn primary"
-	                        disabled={runBusy}
-	                        onClick={async () => {
-	                          const args = {};
-	                          setToolInputMode('form');
-	                          setToolArgsParseErr(null);
-	                          setRunMode('tool');
-	                          setToolName('intercomswap_ln_docker_up');
-	                          setToolArgsBoth(args);
-	                          setPromptOpen(true);
-	                          const ok =
-	                            autoApprove ||
-	                            window.confirm(
-	                              'Start LN docker services now?\n\nThis runs: docker compose up -d (for the compose file configured in onchain/prompt/setup.json).'
-	                            );
-	                          if (!ok) return;
-	                          await runPromptStream({
-	                            prompt: JSON.stringify({ type: 'tool', name: 'intercomswap_ln_docker_up', arguments: args }),
-	                            session_id: sessionId,
-	                            auto_approve: true,
-	                            dry_run: false,
-	                          });
-	                        }}
-	                      >
-	                        Start LN (docker)
-	                      </button>
-	                      <button
-	                        className="btn"
-	                        onClick={() => {
-	                          setRunMode('tool');
-	                          setToolName('intercomswap_ln_docker_ps');
-	                          setToolArgsBoth({});
-	                          setPromptOpen(true);
-	                        }}
-	                      >
-	                        ln_docker_ps
-	                      </button>
-	                    </>
-	                  ) : null}
-	                  <button
-	                    className="btn"
-	                    onClick={() => {
-	                      setRunMode('tool');
-	                      setToolName('intercomswap_ln_listfunds');
-                      setToolArgsBoth({});
-                      setPromptOpen(true);
-                    }}
-                  >
-                    ln_listfunds
-                  </button>
-                </div>
-						</div>
-
-							<div className="field">
-								<div className="field-hd">
-									<span className="mono">5) Solana readiness (settlement)</span>
-									<div className="row">
-										{String(envInfo?.solana?.classify?.kind || '') === 'local' ? (
-											preflight?.sol_local_status?.rpc_listening ? (
-												<span className="chip hi">rpc up</span>
-											) : (
-												<span className="chip warn">rpc down</span>
-											)
-										) : null}
-										{preflight?.sol_signer?.pubkey ? <span className="chip hi">signer ok</span> : <span className="chip">signer?</span>}
-									</div>
-								</div>
-								{String(envInfo?.solana?.classify?.kind || '') === 'local' ? (
-									<>
-										{preflight?.sol_local_status_error ? (
-											<div className="alert bad">{String(preflight.sol_local_status_error)}</div>
-										) : null}
-										{preflight?.sol_local_status ? (
-											<div className="muted small">
-												local validator:{' '}
-												{preflight.sol_local_status.rpc_listening ? 'listening' : 'down'}
-												{preflight.sol_local_status.pid ? ` · pid ${preflight.sol_local_status.pid}` : ''}
-											</div>
-										) : null}
-										<div className="row">
-											{!preflight?.sol_local_status?.rpc_listening ? (
-												<button
-													className="btn primary"
-													disabled={runBusy}
-													onClick={async () => {
-														const args = {};
-														setToolInputMode('form');
-														setToolArgsParseErr(null);
-														setRunMode('tool');
-														setToolName('intercomswap_sol_local_start');
-														setToolArgsBoth(args);
-														setPromptOpen(true);
-														const ok =
-															autoApprove ||
-															window.confirm(
-																'Start local Solana validator now?\n\nThis starts solana-test-validator on localhost and loads the escrow program. Ledger + logs are stored under onchain/ (gitignored).'
-															);
-														if (!ok) return;
-														await runPromptStream({
-															prompt: JSON.stringify({ type: 'tool', name: 'intercomswap_sol_local_start', arguments: args }),
-															session_id: sessionId,
-															auto_approve: true,
-															dry_run: false,
-														});
-													}}
-												>
-													Start Solana (local)
-												</button>
-											) : (
-												<button
-													className="btn"
-													disabled={runBusy}
-													onClick={async () => {
-														const args = {};
-														setToolInputMode('form');
-														setToolArgsParseErr(null);
-														setRunMode('tool');
-														setToolName('intercomswap_sol_local_stop');
-														setToolArgsBoth(args);
-														setPromptOpen(true);
-														const ok =
-															autoApprove ||
-															window.confirm(
-																'Stop local Solana validator now?\n\nThis stops the managed solana-test-validator process. Ledger data is kept under onchain/.'
-															);
-														if (!ok) return;
-														await runPromptStream({
-															prompt: JSON.stringify({ type: 'tool', name: 'intercomswap_sol_local_stop', arguments: args }),
-															session_id: sessionId,
-															auto_approve: true,
-															dry_run: false,
-														});
-													}}
-												>
-													Stop Solana (local)
-												</button>
-											)}
-											<button
-												className="btn"
-												onClick={() => {
-													setRunMode('tool');
-													setToolName('intercomswap_sol_local_status');
-													setToolArgsBoth({});
-													setPromptOpen(true);
-												}}
-											>
-												sol_local_status
-											</button>
-										</div>
-									</>
-								) : (
-									<div className="muted small">Solana RPC is remote; local validator controls are disabled.</div>
-								)}
-	                {preflight?.sol_signer_error ? <div className="alert bad">{String(preflight.sol_signer_error)}</div> : null}
-	                {preflight?.sol_config_error ? <div className="alert bad">{String(preflight.sol_config_error)}</div> : null}
-	                <div className="row">
-	                  <button
-	                    className="btn"
-                    onClick={() => {
-                      setRunMode('tool');
-                      setToolName('intercomswap_sol_signer_pubkey');
-                      setToolArgsBoth({});
-                      setPromptOpen(true);
-                    }}
-                  >
-                    sol_signer_pubkey
-                  </button>
-                  <button
-                    className="btn"
-                    onClick={() => {
-                      setRunMode('tool');
-                      setToolName('intercomswap_sol_config_get');
-                      setToolArgsBoth({});
-                      setPromptOpen(true);
-                    }}
-                  >
-                    sol_config_get
-                  </button>
-                </div>
+                {solBalanceErr ? <div className="alert bad">{solBalanceErr}</div> : null}
               </div>
 
               <div className="field">
@@ -1655,8 +1535,8 @@ function App() {
                 {preflight?.app_error ? <div className="alert bad">{String(preflight.app_error)}</div> : null}
                 {preflight?.app?.app_hash ? (
                   <div className="muted small">
-                    app_hash: <span className="mono">{String(preflight.app.app_hash).slice(0, 32)}…</span>
-                  </div>
+                  app_hash: <span className="mono">{String(preflight.app.app_hash).slice(0, 32)}…</span>
+                </div>
                 ) : null}
               </div>
             </Panel>
@@ -2266,64 +2146,251 @@ function App() {
 
         {activeTab === 'wallets' ? (
           <div className="grid2">
-            <Panel title="Lightning">
-              <button
-                className="btn primary"
-                onClick={() => {
-                  setRunMode('tool');
-                  setToolName('intercomswap_ln_info');
-                  setToolArgsBoth({});
-                  setPromptOpen(true);
-                }}
-              >
-                ln_info
-              </button>
-              <button
-                className="btn"
-                onClick={() => {
-                  setRunMode('tool');
-                  setToolName('intercomswap_ln_listfunds');
-                  setToolArgsBoth({});
-                  setPromptOpen(true);
-                }}
-              >
-                ln_listfunds
-              </button>
-              <button
-                className="btn"
-                onClick={() => {
-                  setRunMode('tool');
-                  setToolName('intercomswap_ln_newaddr');
-                  setToolArgsBoth({});
-                  setPromptOpen(true);
-                }}
-              >
-                ln_newaddr
-              </button>
+            <Panel title="Lightning (BTC)">
+              <div className="muted small">
+                impl/backend/network:{' '}
+                <span className="mono">{String(envInfo?.ln?.impl || '—')}</span> /{' '}
+                <span className="mono">{String(envInfo?.ln?.backend || '—')}</span> /{' '}
+                <span className="mono">{String(envInfo?.ln?.network || '—')}</span>
+              </div>
+              <div className="muted small">
+                node: <span className="mono">{lnAlias || '—'}</span> · id:{' '}
+                <span className="mono">{lnNodeIdShort || '—'}</span>
+              </div>
+              <div className="row">
+                {preflight?.ln_summary?.channels > 0 ? (
+                  <span className="chip hi">{preflight.ln_summary.channels} channel(s)</span>
+                ) : (
+                  <span className="chip warn">no channels</span>
+                )}
+                <button
+                  className="btn"
+                  onClick={() => {
+                    setRunMode('tool');
+                    setToolName('intercomswap_ln_info');
+                    setToolArgsBoth({});
+                    setPromptOpen(true);
+                  }}
+                >
+                  ln_info
+                </button>
+                <button
+                  className="btn"
+                  onClick={() => {
+                    setRunMode('tool');
+                    setToolName('intercomswap_ln_listfunds');
+                    setToolArgsBoth({});
+                    setPromptOpen(true);
+                  }}
+                >
+                  ln_listfunds
+                </button>
+              </div>
+
+              {String(envInfo?.ln?.backend || '') === 'docker' && String(envInfo?.ln?.network || '') === 'regtest' ? (
+                <button
+                  className="btn primary"
+                  disabled={runBusy}
+                  onClick={async () => {
+                    const ok =
+                      autoApprove ||
+                      window.confirm(
+                        'Bootstrap LN regtest now?\n\nThis will mine blocks, fund both LN node wallets, and open a channel (docker-only).'
+                      );
+                    if (!ok) return;
+                    await runPromptStream({
+                      prompt: JSON.stringify({ type: 'tool', name: 'intercomswap_ln_regtest_init', arguments: {} }),
+                      session_id: sessionId,
+                      auto_approve: true,
+                      dry_run: false,
+                    });
+                    void refreshPreflight();
+                  }}
+                >
+                  Bootstrap regtest channel (mine+fund+open)
+                </button>
+              ) : null}
+
+              <div className="field">
+                <div className="field-hd">
+                  <span className="mono">BTC Funding Address</span>
+                </div>
+                <div className="muted small">Send BTC here to fund your LN node wallet.</div>
+                <div className="row">
+                  <input className="input mono" value={lnFundingAddr || ''} readOnly placeholder="Generate an address…" />
+                  <button className="btn" disabled={!lnFundingAddr} onClick={() => copyToClipboard('btc address', lnFundingAddr)}>
+                    Copy
+                  </button>
+                </div>
+                {lnFundingAddrErr ? <div className="alert bad">{lnFundingAddrErr}</div> : null}
+                <div className="row">
+                  <button
+                    className="btn primary"
+                    disabled={runBusy}
+                    onClick={async () => {
+                      const ok =
+                        autoApprove ||
+                        window.confirm('Generate a new BTC funding address from your LN node wallet now?');
+                      if (!ok) return;
+                      try {
+                        const out = await runDirectToolOnce('intercomswap_ln_newaddr', {}, { auto_approve: true });
+                        const addr = String(out?.address || '').trim();
+                        if (!addr) throw new Error('ln_newaddr returned no address');
+                        setLnFundingAddr(addr);
+                        setLnFundingAddrErr(null);
+                      } catch (e: any) {
+                        setLnFundingAddrErr(e?.message || String(e));
+                      }
+                    }}
+                  >
+                    Generate BTC address
+                  </button>
+                </div>
+              </div>
+
+              <div className="field">
+                <div className="field-hd">
+                  <span className="mono">Open Your First Channel</span>
+                </div>
+                <div className="muted small">
+                  Channels are reused across swaps. You typically need at least one channel to pay/receive invoices.
+                </div>
+                <div className="row">
+                  <input
+                    className="input mono"
+                    value={lnPeerInput}
+                    onChange={(e) => {
+                      const v = e.target.value;
+                      setLnPeerInput(v);
+                      const m = String(v || '').trim().match(/^([0-9a-fA-F]{66})@/);
+                      if (m) setLnChannelNodeId(m[1]);
+                    }}
+                    placeholder="peer (nodeid@host:port)"
+                  />
+                  <button
+                    className="btn primary"
+                    disabled={runBusy || !lnPeerInput.trim()}
+                    onClick={async () => {
+                      const peer = lnPeerInput.trim();
+                      const ok = autoApprove || window.confirm(`Connect to LN peer?\n\n${peer}`);
+                      if (!ok) return;
+                      await runPromptStream({
+                        prompt: JSON.stringify({ type: 'tool', name: 'intercomswap_ln_connect', arguments: { peer } }),
+                        session_id: sessionId,
+                        auto_approve: true,
+                        dry_run: false,
+                      });
+                    }}
+                  >
+                    Connect
+                  </button>
+                </div>
+                <div className="row">
+                  <input
+                    className="input mono"
+                    value={lnChannelNodeId}
+                    onChange={(e) => setLnChannelNodeId(e.target.value)}
+                    placeholder="node id (hex33)"
+                  />
+                  <input
+                    className="input mono"
+                    value={String(lnChannelAmountSats)}
+                    onChange={(e) => {
+                      const n = Number.parseInt(e.target.value, 10);
+                      if (Number.isFinite(n)) setLnChannelAmountSats(Math.max(0, Math.trunc(n)));
+                    }}
+                    placeholder="amount sats"
+                  />
+                  <label className="check">
+                    <input
+                      type="checkbox"
+                      checked={lnChannelPrivate}
+                      onChange={(e) => setLnChannelPrivate(e.target.checked)}
+                    />
+                    private
+                  </label>
+                  <button
+                    className="btn primary"
+                    disabled={runBusy || !lnChannelNodeId.trim() || lnChannelAmountSats <= 0}
+                    onClick={async () => {
+                      const node_id = lnChannelNodeId.trim();
+                      const amount_sats = lnChannelAmountSats;
+                      const ok =
+                        autoApprove ||
+                        window.confirm(`Open LN channel?\n\nnode_id: ${node_id}\namount_sats: ${amount_sats}`);
+                      if (!ok) return;
+                      await runPromptStream({
+                        prompt: JSON.stringify({
+                          type: 'tool',
+                          name: 'intercomswap_ln_fundchannel',
+                          arguments: { node_id, amount_sats, private: lnChannelPrivate },
+                        }),
+                        session_id: sessionId,
+                        auto_approve: true,
+                        dry_run: false,
+                      });
+                      void refreshPreflight();
+                    }}
+                  >
+                    Open Channel
+                  </button>
+                </div>
+              </div>
             </Panel>
+
             <Panel title="Solana">
-              <button
-                className="btn primary"
-                onClick={() => {
-                  setRunMode('tool');
-                  setToolName('intercomswap_sol_config_get');
-                  setToolArgsBoth({});
-                  setPromptOpen(true);
-                }}
-              >
-                sol_config_get
-              </button>
-              <button
-                className="btn"
-                onClick={() => {
-                  setRunMode('tool');
-                  setToolName('intercomswap_sol_balance');
-                  setToolArgsBoth({ pubkey: '...' });
-                  setPromptOpen(true);
-                }}
-              >
-                sol_balance
-              </button>
+              <div className="muted small">
+                rpc: <span className="mono">{String(Array.isArray(envInfo?.solana?.rpc_urls) ? envInfo.solana.rpc_urls[0] : '—')}</span>
+              </div>
+              <div className="field">
+                <div className="field-hd">
+                  <span className="mono">Funding Address (SOL)</span>
+                </div>
+                <div className="muted small">
+                  Fund this address with SOL for transaction fees. Tokens (USDT) are received to the associated token
+                  account of this owner address.
+                </div>
+                <div className="row">
+                  <input className="input mono" value={solSignerPubkey || ''} readOnly placeholder="sol signer pubkey…" />
+                  <button className="btn" disabled={!solSignerPubkey} onClick={() => copyToClipboard('solana pubkey', solSignerPubkey)}>
+                    Copy
+                  </button>
+                </div>
+                {solBalanceErr ? <div className="alert bad">{solBalanceErr}</div> : null}
+                {solBalance !== null && solBalance !== undefined ? (
+                  <div className="muted small">
+                    balance (lamports): <span className="mono">{String(solBalance)}</span>
+                  </div>
+                ) : null}
+                <div className="row">
+                  <button
+                    className="btn primary"
+                    disabled={runBusy || !solSignerPubkey}
+                    onClick={async () => {
+                      try {
+                        const lamports = await runDirectToolOnce('intercomswap_sol_balance', { pubkey: solSignerPubkey }, { auto_approve: false });
+                        setSolBalance(lamports);
+                        setSolBalanceErr(null);
+                      } catch (e: any) {
+                        setSolBalanceErr(e?.message || String(e));
+                      }
+                    }}
+                  >
+                    Refresh SOL balance
+                  </button>
+                  <button
+                    className="btn"
+                    onClick={() => {
+                      setRunMode('tool');
+                      setToolName('intercomswap_sol_config_get');
+                      setToolArgsBoth({});
+                      setPromptOpen(true);
+                    }}
+                  >
+                    sol_config_get
+                  </button>
+                </div>
+              </div>
             </Panel>
           </div>
         ) : null}
@@ -2634,8 +2701,14 @@ function App() {
                 <button
                   className="btn primary"
                   onClick={onRun}
-                  disabled={runBusy}
-                  title={toolRequiresApproval(toolName) && !autoApprove ? 'Will ask for one-time approval' : ''}
+                  disabled={runBusy || (toolNeedsFullStack(toolName) && !stackGate.ok)}
+                  title={
+                    toolNeedsFullStack(toolName) && !stackGate.ok
+                      ? `Blocked until stack is ready:\n${stackGate.reasons.map((r) => `- ${r}`).join('\n')}`
+                      : toolRequiresApproval(toolName) && !autoApprove
+                        ? 'Will ask for one-time approval'
+                        : ''
+                  }
                 >
                   {runBusy ? 'Running…' : toolRequiresApproval(toolName) && !autoApprove ? 'Approve + Run' : 'Run'}
                 </button>
@@ -2696,7 +2769,16 @@ function App() {
                 placeholder="Natural-language prompt (advanced). Avoid pasting untrusted peer content."
               />
               <div className="row">
-                <button className="btn primary" onClick={onRun}>
+                <button
+                  className="btn primary"
+                  onClick={onRun}
+                  disabled={runBusy || !stackGate.ok}
+                  title={
+                    !stackGate.ok
+                      ? `Blocked until stack is ready:\n${stackGate.reasons.map((r) => `- ${r}`).join('\n')}`
+                      : ''
+                  }
+                >
                   {runBusy ? 'Running…' : 'Run'}
                 </button>
                 <button className="btn" onClick={() => setPromptInput('')}>
@@ -2771,6 +2853,15 @@ const READONLY_TOOLS = new Set<string>([
 
 function toolRequiresApproval(name: string) {
   return !READONLY_TOOLS.has(String(name || '').trim());
+}
+
+function toolNeedsFullStack(name: string) {
+  const n = String(name || '').trim();
+  if (!n) return false;
+  // Outbound network messaging and swap protocol actions should not run unless settlement is ready.
+  if (n === 'intercomswap_sc_send_text' || n === 'intercomswap_sc_send_json' || n === 'intercomswap_sc_open') return true;
+  const g = toolGroup(n);
+  return g === 'RFQ Protocol' || g === 'RFQ Bots' || g === 'Swap Helpers';
 }
 
 function toolGroup(name: string) {

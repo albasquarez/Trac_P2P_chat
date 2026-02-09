@@ -168,6 +168,10 @@ export async function solLocalStart({
   const pidText = fs.existsSync(paths.pid) ? fs.readFileSync(paths.pid, 'utf8').trim() : '';
   const existingPid = pidText ? Number.parseInt(pidText, 10) : null;
   if (existingPid && Number.isFinite(existingPid) && isAlive(existingPid)) {
+    // If the PID is alive but the RPC port isn't listening yet, treat this as "starting" and wait a bit.
+    // If it never comes up, restart the validator instead of returning a misleading "already running".
+    const listening = await isTcpListening({ host, port: rpcPort, timeoutMs: 250 });
+    if (listening) {
     return {
       type: 'sol_local_already_running',
       name,
@@ -177,6 +181,33 @@ export async function solLocalStart({
       pid: existingPid,
       log: paths.log,
     };
+    }
+
+    // Wait briefly for RPC to come up (common during startup).
+    const waitMs = Math.max(0, Math.min(Number.isFinite(readyTimeoutMs) ? readyTimeoutMs : 0, 4000));
+    if (waitMs > 0) {
+      try {
+        await waitForTcp({ host, port: rpcPort, timeoutMs: waitMs });
+        return {
+          type: 'sol_local_already_running',
+          name,
+          host,
+          rpc_port: rpcPort,
+          rpc_url: `http://${host}:${rpcPort}`,
+          pid: existingPid,
+          log: paths.log,
+        };
+      } catch (_e) {}
+    }
+
+    // Unhealthy: kill and restart.
+    try {
+      process.kill(existingPid, 'SIGINT');
+      await waitForExit(existingPid, 5000);
+    } catch (_e) {}
+    try {
+      fs.unlinkSync(paths.pid);
+    } catch (_e) {}
   }
 
   const ledger =
@@ -289,4 +320,3 @@ export async function solLocalStop({
   } catch (_e) {}
   return { type: 'sol_local_stopped', name, pid };
 }
-

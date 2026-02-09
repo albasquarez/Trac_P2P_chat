@@ -1123,7 +1123,9 @@ Prereqs:
   - Linux: the `docker` service must be running.
   - You generally do **not** need to run docker commands manually:
     - Collin: Overview step `4) Lightning readiness` -> `Start LN (docker)` / `ln_docker_ps`
+    - Collin (regtest): `Bootstrap regtest channel` (mines + funds + opens a channel)
     - Tools: `intercomswap_ln_docker_up`, `intercomswap_ln_docker_ps`, `intercomswap_ln_docker_down`
+    - Tool (regtest convenience): `intercomswap_ln_regtest_init`
     - These run `docker compose` against the compose file configured in `onchain/prompt/setup.json` (default `dev/ln-regtest/docker-compose.yml`).
 - Rust toolchain + Solana CLI (for `cargo build-sbf` and `solana-test-validator`).
   - Collin: Overview step `5) Solana readiness` -> `Start Solana (local)` / `sol_local_status`
@@ -1154,6 +1156,7 @@ What `npm run test:e2e` does:
 Lightning channel note:
 - LN channels are **not opened per trade**. Open channels ahead of time and reuse them for many swaps.
 - A direct channel is only between 2 LN nodes, but you can usually pay many different counterparties via routing across the LN network (if a route exists).
+- Collin will block RFQ/Offer/Bot tools until at least one LN channel exists (to prevent “can’t settle” operator footguns).
 
 Lightning network flag reminder:
 - CLN mainnet is `--ln-network bitcoin`
