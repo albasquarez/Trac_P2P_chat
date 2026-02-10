@@ -1,7 +1,18 @@
 import { useEffect, useMemo, useRef, useState } from 'react';
 import { useVirtualizer } from '@tanstack/react-virtual';
 import './app.css';
-import { promptAdd, promptListBefore, promptListLatest, scAdd, scListBefore, scListLatest } from './lib/db';
+import {
+  chatAdd,
+  chatClear,
+  chatListBefore,
+  chatListLatest,
+  promptAdd,
+  promptListBefore,
+  promptListLatest,
+  scAdd,
+  scListBefore,
+  scListLatest,
+} from './lib/db';
 
 type OracleSummary = { ok: boolean; ts: number | null; btc_usd: number | null; usdt_usd: number | null; btc_usdt: number | null };
 
@@ -24,7 +35,20 @@ function App() {
   const [health, setHealth] = useState<{ ok: boolean; ts: number } | null>(null);
   const [tools, setTools] = useState<Array<any> | null>(null);
 
-  const [sessionId, setSessionId] = useState<string | null>(null);
+  const [sessionId, setSessionId] = useState<string>(() => {
+    try {
+      const v = String(window.localStorage.getItem('collin_prompt_session_id') || '').trim();
+      if (v) return v;
+    } catch (_e) {}
+    const gen =
+      (globalThis.crypto && typeof (globalThis.crypto as any).randomUUID === 'function'
+        ? (globalThis.crypto as any).randomUUID()
+        : `sess-${Date.now()}-${Math.random().toString(16).slice(2)}`) || `sess-${Date.now()}`;
+    try {
+      window.localStorage.setItem('collin_prompt_session_id', gen);
+    } catch (_e) {}
+    return gen;
+  });
   const [autoApprove, setAutoApprove] = useState(false);
   const [runMode, setRunMode] = useState<'tool' | 'llm'>('tool');
 
@@ -37,8 +61,11 @@ function App() {
 	  const [selected, setSelected] = useState<any>(null);
 
 		  const [promptInput, setPromptInput] = useState('');
-	  const [promptChat, setPromptChat] = useState<Array<{ id: string; role: 'user' | 'assistant'; ts: number; text: string }>>([]);
+	  const [promptChat, setPromptChat] = useState<Array<{ id: number; role: 'user' | 'assistant'; ts: number; text: string }>>([]);
 	  const promptChatListRef = useRef<HTMLDivElement | null>(null);
+    const [promptChatFollowTail, setPromptChatFollowTail] = useState(true);
+    const [promptChatUnseen, setPromptChatUnseen] = useState(0);
+    const promptChatFollowTailRef = useRef(true);
 	  const [toolFilter, setToolFilter] = useState('');
 	  const [toolName, setToolName] = useState('');
 	  const [toolArgsText, setToolArgsText] = useState('{\n  \n}');
@@ -50,6 +77,7 @@ function App() {
   const [scEvents, setScEvents] = useState<any[]>([]);
   const scEventsMax = 3000;
   const promptEventsMax = 3000;
+  const promptChatMax = 1200;
 
   const [runBusy, setRunBusy] = useState(false);
   const [runErr, setRunErr] = useState<string | null>(null);
@@ -142,6 +170,12 @@ function App() {
       window.localStorage.setItem('collin_sol_cu_price', String(solCuPrice || 0));
     } catch (_e) {}
   }, [solCuLimit, solCuPrice]);
+
+  useEffect(() => {
+    try {
+      window.localStorage.setItem('collin_prompt_session_id', String(sessionId || ''));
+    } catch (_e) {}
+  }, [sessionId]);
 
   useEffect(() => {
     try {
@@ -243,9 +277,13 @@ function App() {
 
   const scLoadingOlderRef = useRef(false);
   const promptLoadingOlderRef = useRef(false);
+  const chatLoadingOlderRef = useRef(false);
 
   // Logs render newest-first. If the operator is scrolled away from the top, keep their viewport stable
   // when new events arrive (avoid jumpiness).
+  useEffect(() => {
+    promptChatFollowTailRef.current = promptChatFollowTail;
+  }, [promptChatFollowTail]);
 
   const filteredScEvents = useMemo(() => {
     const chan = scFilter.channel.trim().toLowerCase();
@@ -277,6 +315,10 @@ function App() {
     } catch (_e) {
       return '';
     }
+  };
+
+  const normalizeChatRole = (v: any): 'user' | 'assistant' => {
+    return String(v || '').trim() === 'assistant' ? 'assistant' : 'user';
   };
 
   function finalEventContentJson(e: any) {
@@ -598,6 +640,49 @@ function App() {
       });
     } finally {
       promptLoadingOlderRef.current = false;
+    }
+  }
+
+  function oldestChatId(list: any[]) {
+    if (!Array.isArray(list) || list.length === 0) return null;
+    const first = list[0];
+    const id = typeof first?.id === 'number' ? first.id : null;
+    return id !== null && Number.isFinite(id) ? id : null;
+  }
+
+  async function loadOlderChatMessages({ limit = 200 } = {}) {
+    if (chatLoadingOlderRef.current) return;
+    const beforeId = oldestChatId(promptChat);
+    if (!beforeId) return;
+    chatLoadingOlderRef.current = true;
+
+    const el = promptChatListRef.current;
+    const prevHeight = el ? el.scrollHeight : 0;
+    const prevTop = el ? el.scrollTop : 0;
+
+    try {
+      const older = await chatListBefore({ beforeId, limit });
+      if (!older || older.length === 0) return;
+      // DB returns newest-first; chat UI wants oldest-first.
+      const mapped = older
+        .map((r: any) => ({ id: Number(r.id), role: normalizeChatRole(r.role), ts: Number(r.ts), text: String(r.text || '') }))
+        .reverse();
+      setPromptChat((prev) => {
+        const seen = new Set(prev.map((m) => m?.id).filter((n) => typeof n === 'number'));
+        const toAdd = mapped.filter((m) => typeof m?.id === 'number' && !seen.has(m.id));
+        const next = toAdd.concat(prev);
+        // Keep chat memory bounded. If we exceed the window, drop newest items (operators can jump back to latest).
+        if (next.length <= promptChatMax) return next;
+        return next.slice(0, promptChatMax);
+      });
+      requestAnimationFrame(() => {
+        const el2 = promptChatListRef.current;
+        if (!el2) return;
+        const delta = el2.scrollHeight - prevHeight;
+        if (delta > 0) el2.scrollTop = prevTop + delta;
+      });
+    } finally {
+      chatLoadingOlderRef.current = false;
     }
   }
 
@@ -1835,6 +1920,54 @@ function App() {
     }
   }
 
+  function scrollChatToBottom() {
+    const el = promptChatListRef.current;
+    if (!el) return;
+    el.scrollTop = el.scrollHeight;
+  }
+
+  async function appendChatMessage(
+    role: 'user' | 'assistant',
+    text: string,
+    { forceFollowTail = false }: { forceFollowTail?: boolean } = {}
+  ) {
+    const ts = Date.now();
+    const clean = String(text || '').slice(0, 200_000);
+    const follow = forceFollowTail || Boolean(promptChatFollowTailRef.current);
+    if (forceFollowTail) {
+      promptChatFollowTailRef.current = true;
+      setPromptChatFollowTail(true);
+      setPromptChatUnseen(0);
+    }
+
+    let id: number | null = null;
+    try {
+      id = await chatAdd({ ts, role, text: clean });
+    } catch (_e) {
+      id = null;
+    }
+
+    const msg = {
+      id: id !== null ? id : Math.floor(Date.now() + Math.random() * 1000),
+      role,
+      ts,
+      text: clean,
+    };
+
+    if (!follow && role === 'assistant') {
+      setPromptChatUnseen((n) => Math.min(999, n + 1));
+      return;
+    }
+
+    setPromptChat((prev) => {
+      const next = prev.concat([msg]);
+      if (next.length <= promptChatMax) return next;
+      // Keep newest window in memory.
+      return next.slice(next.length - promptChatMax);
+    });
+    if (follow) requestAnimationFrame(scrollChatToBottom);
+  }
+
   async function appendScEvent(evt: any, { persist = true } = {}) {
     const e = evt && typeof evt === 'object' ? evt : { type: 'event', evt };
     const msgTs = e?.message && typeof e.message.ts === 'number' ? e.message.ts : null;
@@ -2291,6 +2424,21 @@ function App() {
         const pe = await promptListLatest({ limit: 300 });
         setPromptEvents(pe.map((r) => ({ ...(r.evt || {}), db_id: r.id })));
       } catch (_e) {}
+      try {
+        const ch = await chatListLatest({ limit: 300 });
+        // DB returns newest-first; chat UI wants oldest-first.
+        setPromptChat(
+          ch
+            .map((r: any) => ({
+              id: Number(r.id),
+              role: normalizeChatRole(r.role),
+              ts: Number(r.ts),
+              text: String(r.text || ''),
+            }))
+            .reverse()
+        );
+        requestAnimationFrame(scrollChatToBottom);
+      } catch (_e) {}
     })();
   }, []);
 
@@ -2308,6 +2456,27 @@ function App() {
     if (!cur) return;
     const nearBottom = cur.scrollHeight - cur.scrollTop - cur.clientHeight < 180;
     if (nearBottom) void loadOlderPromptEvents({ limit: 250 });
+  };
+
+  const onPromptChatScroll = () => {
+    const cur = promptChatListRef.current;
+    if (!cur) return;
+    const distBottom = cur.scrollHeight - cur.scrollTop - cur.clientHeight;
+    const nearBottom = distBottom < 160;
+    const nearTop = cur.scrollTop < 160;
+
+    const following = Boolean(promptChatFollowTailRef.current);
+    if (following && !nearBottom) {
+      promptChatFollowTailRef.current = false;
+      setPromptChatFollowTail(false);
+    }
+    if (!following && nearBottom) {
+      promptChatFollowTailRef.current = true;
+      setPromptChatFollowTail(true);
+      setPromptChatUnseen(0);
+    }
+
+    if (nearTop) void loadOlderChatMessages({ limit: 250 });
   };
 
   const onTradesScroll = () => {
@@ -2642,13 +2811,12 @@ function App() {
                   onClick={async () => {
                     const text = promptInput.trim();
                     if (!text) return;
-                    const userMsg = { id: `u-${Date.now()}-${Math.random().toString(16).slice(2)}`, role: 'user' as const, ts: Date.now(), text };
-                    setPromptChat((prev) => prev.concat([userMsg]));
                     setPromptInput('');
                     setRunMode('llm');
                     setRunErr(null);
                     setRunBusy(true);
                     try {
+                      await appendChatMessage('user', text, { forceFollowTail: true });
                       const out = await fetchJson('/v1/run', {
                         method: 'POST',
                         body: JSON.stringify({ prompt: text, session_id: sessionId, auto_approve: autoApprove, dry_run: false }),
@@ -2662,15 +2830,11 @@ function App() {
                           : out && typeof out === 'object' && typeof out.content === 'string'
                             ? out.content
                             : JSON.stringify(out, null, 2);
-                      setPromptChat((prev) =>
-                        prev.concat([{ id: `a-${Date.now()}-${Math.random().toString(16).slice(2)}`, role: 'assistant' as const, ts: Date.now(), text: reply }])
-                      );
+                      await appendChatMessage('assistant', reply);
                     } catch (e: any) {
                       const msg = e?.message || String(e);
                       pushToast('error', msg);
-                      setPromptChat((prev) =>
-                        prev.concat([{ id: `a-${Date.now()}-${Math.random().toString(16).slice(2)}`, role: 'assistant' as const, ts: Date.now(), text: `Error: ${msg}` }])
-                      );
+                      await appendChatMessage('assistant', `Error: ${msg}`);
                     } finally {
                       setRunBusy(false);
                     }
@@ -2679,17 +2843,73 @@ function App() {
                 >
                   {runBusy ? 'Running…' : 'Run'}
                 </button>
-                <button className="btn" onClick={() => setPromptChat([])} disabled={runBusy}>
+                <button
+                  className="btn"
+                  onClick={async () => {
+                    try {
+                      await chatClear();
+                    } catch (_e) {}
+                    setPromptChat([]);
+                    setPromptChatUnseen(0);
+                    promptChatFollowTailRef.current = true;
+                    setPromptChatFollowTail(true);
+                    requestAnimationFrame(scrollChatToBottom);
+                  }}
+                  disabled={runBusy}
+                >
                   Clear chat
                 </button>
               </div>
             </Panel>
             <Panel title="Chat">
+              <div className="row" style={{ justifyContent: 'space-between' }}>
+                <div className="muted small">
+                  {promptChatFollowTail ? (
+                    <span className="chip hi">following</span>
+                  ) : (
+                    <span className="chip warn">paused</span>
+                  )}
+                  {promptChatUnseen > 0 ? (
+                    <span className="chip" style={{ marginLeft: 8 }}>
+                      {promptChatUnseen} new
+                    </span>
+                  ) : null}
+                </div>
+                {!promptChatFollowTail || promptChatUnseen > 0 ? (
+                  <button
+                    className="btn small"
+                    onClick={async () => {
+                      promptChatFollowTailRef.current = true;
+                      setPromptChatFollowTail(true);
+                      setPromptChatUnseen(0);
+                      try {
+                        const ch = await chatListLatest({ limit: 300 });
+                        setPromptChat(
+                          ch
+                            .map((r: any) => ({
+                              id: Number(r.id),
+                              role: normalizeChatRole(r.role),
+                              ts: Number(r.ts),
+                              text: String(r.text || ''),
+                            }))
+                            .reverse()
+                        );
+                      } catch (_e) {}
+                      requestAnimationFrame(scrollChatToBottom);
+                    }}
+                  >
+                    Scroll to bottom
+                  </button>
+                ) : (
+                  <span />
+                )}
+              </div>
               <VirtualList
                 listRef={promptChatListRef}
                 items={promptChat}
                 itemKey={(m) => String(m?.id || Math.random())}
                 estimatePx={84}
+                onScroll={onPromptChatScroll}
                 render={(m) => (
                   <div className="rowitem">
                     <div className="rowitem-top">
