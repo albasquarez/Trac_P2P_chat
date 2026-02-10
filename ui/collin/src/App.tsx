@@ -658,7 +658,7 @@ function App() {
     const now = uiNowMs;
     const out: any[] = [];
     const seen = new Set<string>();
-    for (const e of filteredScEvents) {
+    for (const e of scEvents) {
       try {
         if (String((e as any)?.kind || '') !== 'swap.swap_invite') continue;
         const msg = (e as any)?.message;
@@ -677,7 +677,7 @@ function App() {
       } catch (_e) {}
     }
     return out;
-  }, [filteredScEvents, showExpiredInvites, dismissedInviteTradeIds, showDismissedInvites, uiNowMs]);
+  }, [scEvents, showExpiredInvites, dismissedInviteTradeIds, showDismissedInvites, uiNowMs]);
 
   const knownChannels = useMemo(() => {
     const set = new Set<string>();
@@ -723,7 +723,7 @@ function App() {
     const now = uiNowMs;
 
     const candidates: Array<{ swapCh: string; tradeId: string; expiresAtMs: number }> = [];
-    for (const e of filteredScEvents) {
+    for (const e of scEvents) {
       try {
         if (String((e as any)?.kind || '') !== 'swap.swap_invite') continue;
         const msg = (e as any)?.message;
@@ -762,7 +762,7 @@ function App() {
       cancelled = true;
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [health?.ok, joinedChannels, filteredScEvents, uiNowMs, watchedChannelsSet]);
+  }, [health?.ok, joinedChannels, scEvents, uiNowMs, watchedChannelsSet]);
 
   function dismissInviteTrade(tradeIdRaw: string) {
     const tradeId = String(tradeIdRaw || '').trim();
