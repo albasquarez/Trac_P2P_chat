@@ -2320,23 +2320,24 @@ function App() {
                 {solBalanceErr ? <div className="alert bad">{solBalanceErr}</div> : null}
               </div>
 
-	              <div className="field">
-	                <div className="field-hd">
-	                  <span className="mono">Lightning Channel</span>
-	                </div>
-	                <div className="row">
-	                  {lnChannelCount > 0 ? <span className="chip hi">{lnChannelCount} channel(s)</span> : <span className="chip warn">no channels</span>}
-	                  {needLnBootstrap ? (
-	                    <button className="btn primary" onClick={ensureLnRegtestChannel} disabled={runBusy || stackOpBusy}>
-	                      Bootstrap regtest
-	                    </button>
-	                  ) : (
-	                    <button className="btn" onClick={() => setActiveTab('wallets')}>
-	                      Open channel…
-	                    </button>
-	                  )}
-	                </div>
-	              </div>
+		              <div className="field">
+		                <div className="field-hd">
+		                  <span className="mono">Lightning Channel</span>
+		                </div>
+		                <div className="row">
+		                  {lnChannelCount > 0 ? <span className="chip hi">{lnChannelCount} channel(s)</span> : <span className="chip warn">no channels</span>}
+		                  {needLnBootstrap ? (
+		                    <button className="btn primary" onClick={ensureLnRegtestChannel} disabled={runBusy || stackOpBusy}>
+		                      Bootstrap regtest
+		                    </button>
+		                  ) : (
+		                    <button className="btn" onClick={() => setActiveTab('wallets')}>
+		                      Open channel…
+		                    </button>
+		                  )}
+		                </div>
+		                <div className="muted small">Lightning routes automatically across your open channels when paying invoices.</div>
+		              </div>
             </Panel>
 
 	            <Panel title="Live Feed">
