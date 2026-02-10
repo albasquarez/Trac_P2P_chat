@@ -147,6 +147,9 @@ async function startSolanaValidator({ soPath, ledgerSuffix }) {
     faucetPort,
     tail: () => out,
     stop: async () => {
+      try {
+        connection?._rpcWebSocket?.close?.();
+      } catch (_e) {}
       proc.kill('SIGINT');
       await new Promise((r) => proc.once('exit', r));
     },
@@ -371,6 +374,11 @@ test('e2e: promptd direct-tool mode drives full swap (LN regtest <-> Solana escr
   });
 
   // Start LN stack.
+  // Ensure a clean slate: stale lightning-rpc sockets in the volume can cause ECONNREFUSED,
+  // and fixed invoice labels can collide across runs if volumes are reused.
+  try {
+    await dockerCompose(['down', '-v', '--remove-orphans']);
+  } catch (_e) {}
   await dockerCompose(['up', '-d']);
   t.after(async () => {
     try {

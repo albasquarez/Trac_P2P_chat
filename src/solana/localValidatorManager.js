@@ -131,6 +131,8 @@ export async function solLocalStatus({
   const pid = pidText ? Number.parseInt(pidText, 10) : null;
   const alive = pid && Number.isFinite(pid) ? isAlive(pid) : false;
   const listening = await isTcpListening({ host, port: rpcPort, timeoutMs: 250 });
+  const pubsubPort = Number.isInteger(cfg?.rpc_pubsub_port) ? cfg.rpc_pubsub_port : rpcPort + 1;
+  const pubsubListening = await isTcpListening({ host, port: pubsubPort, timeoutMs: 250 });
 
   return {
     type: 'sol_local_status',
@@ -138,9 +140,12 @@ export async function solLocalStatus({
     host,
     rpc_port: rpcPort,
     rpc_url: `http://${host}:${rpcPort}`,
+    rpc_pubsub_port: pubsubPort,
+    ws_url: `ws://${host}:${pubsubPort}`,
     pid: alive ? pid : null,
     alive: Boolean(alive),
     rpc_listening: Boolean(listening),
+    pubsub_listening: Boolean(pubsubListening),
     log: cfg?.log || paths.log,
     ledger_dir: cfg?.ledger_dir || null,
     program_id: cfg?.program_id || null,
@@ -239,6 +244,17 @@ export async function solLocalStart({
   if (!Number.isInteger(faucetPort) || faucetPort <= 0 || faucetPort > 65535) throw new Error('faucet_port must be a valid port');
   if (!programId || typeof programId !== 'string') throw new Error('program_id is required');
 
+  // @solana/web3.js derives the PubSub websocket endpoint as rpcPort+1 when wsEndpoint isn't specified.
+  // In this environment, solana-test-validator uses rpcPort+1 for PubSub. We do not pass any explicit
+  // flag for that port because older solana-test-validator builds may not support it.
+  const pubsubPort = rpcPort + 1;
+  if (!Number.isInteger(pubsubPort) || pubsubPort <= 0 || pubsubPort > 65535) {
+    throw new Error('rpc_port too large (rpc_port+1 out of range for websocket port)');
+  }
+  if (pubsubPort === faucetPort) {
+    throw new Error('websocket port (rpc_port+1) would collide with faucet_port; choose a different faucet_port');
+  }
+
   const args = [];
   if (reset) args.push('--reset');
   args.push('--ledger', ledger);
@@ -267,8 +283,10 @@ export async function solLocalStart({
     pid: child.pid,
     host,
     rpc_port: rpcPort,
+    rpc_pubsub_port: pubsubPort,
     faucet_port: faucetPort,
     rpc_url: `http://${host}:${rpcPort}`,
+    ws_url: `ws://${host}:${pubsubPort}`,
     ledger_dir: ledger,
     program_id: String(programId).trim(),
     so_path: soResolved,

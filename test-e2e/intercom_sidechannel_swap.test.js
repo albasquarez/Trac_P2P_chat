@@ -223,6 +223,9 @@ async function startSolanaValidator({ soPath, ledgerSuffix }) {
     faucetPort,
     tail: () => out,
     stop: async () => {
+      try {
+        connection?._rpcWebSocket?.close?.();
+      } catch (_e) {}
       proc.kill('SIGINT');
       await new Promise((r) => proc.once('exit', r));
     },

@@ -887,11 +887,29 @@ test('e2e: prompt tool offer_post broadcasts swap.svc_announce', async (t) => {
   });
   ensureOk(await announcerSc.send(channel, preflight), 'send preflight (initial)');
   let preflightStop = false;
+  let preflightTicks = 0;
   const preflightResender = setInterval(async () => {
     if (preflightStop) return;
+    preflightTicks += 1;
     try {
       await announcerSc.send(channel, preflight);
     } catch (_e) {}
+    // Under load, swarm joins/flush can lag. Re-join/re-subscribe periodically to retrigger discovery.
+    // (join() is idempotent and will re-run swarm.join()+flush() in the sidechannel feature.)
+    if (preflightTicks % 10 === 0) {
+      try {
+        await announcerSc.join(channel);
+      } catch (_e) {}
+      try {
+        await listenerSc.join(channel);
+      } catch (_e) {}
+      try {
+        await announcerSc.subscribe([channel]);
+      } catch (_e) {}
+      try {
+        await listenerSc.subscribe([channel]);
+      } catch (_e) {}
+    }
   }, 250);
   t.after(() => clearInterval(preflightResender));
   await preflightWait;

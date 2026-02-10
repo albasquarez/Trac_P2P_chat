@@ -215,6 +215,11 @@ async function startSolanaValidator({ soPath, ledgerSuffix }) {
     faucetPort,
     tail: () => out,
     stop: async () => {
+      // @solana/web3.js keeps a reconnecting PubSub websocket. Close it to avoid noisy ECONNREFUSED spam
+      // after the validator is shut down (and to let the test runner exit cleanly).
+      try {
+        connection?._rpcWebSocket?.close?.();
+      } catch (_e) {}
       proc.kill('SIGINT');
       await new Promise((r) => proc.once('exit', r));
     },
@@ -232,11 +237,17 @@ async function sendAndConfirm(connection, tx) {
 
 test('e2e: LN<->Solana escrow flows', async (t) => {
   const runId = crypto.randomBytes(4).toString('hex');
+  const lnLabel = (base) => `${base}_${runId}`;
   // Ensure our SBF program is built.
   await sh('cargo', ['build-sbf'], { cwd: path.join(repoRoot, 'solana/ln_usdt_escrow') });
   const soPath = path.join(repoRoot, 'solana/ln_usdt_escrow/target/deploy/ln_usdt_escrow.so');
 
   // Start LN stack.
+  // Ensure a clean slate: stale lightning-rpc sockets in the volume can cause ECONNREFUSED,
+  // and fixed invoice labels can collide across runs if volumes are reused.
+  try {
+    await dockerCompose(['down', '-v', '--remove-orphans']);
+  } catch (_e) {}
   await dockerCompose(['up', '-d']);
   t.after(async () => {
     try {
@@ -309,7 +320,7 @@ test('e2e: LN<->Solana escrow flows', async (t) => {
   }, { label: 'channel active', tries: 120, delayMs: 500 });
 
   // Alice creates invoice (normal invoice; no hodl invoices).
-  const invoice = await clnCli('cln-alice', ['invoice', '100000msat', 'swap1', 'swap test']);
+  const invoice = await clnCli('cln-alice', ['invoice', '100000msat', lnLabel('swap1'), 'swap test']);
   const bolt11 = invoice.bolt11;
   const paymentHashHex = parseHex32(invoice.payment_hash, 'payment_hash');
 
@@ -469,7 +480,7 @@ test('e2e: LN<->Solana escrow flows', async (t) => {
   assert.equal(afterState.tradeFeeAmount, 0n, 'escrow drained');
 
   await t.test('refund path: escrow refunds after timeout', async () => {
-    const invoice2 = await clnCli('cln-alice', ['invoice', '100000msat', 'swap2', 'swap refund']);
+    const invoice2 = await clnCli('cln-alice', ['invoice', '100000msat', lnLabel('swap2'), 'swap refund']);
     const paymentHash2 = parseHex32(invoice2.payment_hash, 'payment_hash');
 
     const now2 = Math.floor(Date.now() / 1000);
@@ -492,10 +503,10 @@ test('e2e: LN<->Solana escrow flows', async (t) => {
     await sendAndConfirm(connection, escrowTx2);
 
     // Persist a minimal receipt so the operator can refund deterministically.
-    const runId = crypto.randomBytes(4).toString('hex');
-    const receiptsDb = path.join(repoRoot, `onchain/receipts/e2e-swaprecover-refund-${runId}.sqlite`);
+    const refundRunId = crypto.randomBytes(4).toString('hex');
+    const receiptsDb = path.join(repoRoot, `onchain/receipts/e2e-swaprecover-refund-${refundRunId}.sqlite`);
     const store = openTradeReceiptsStore({ dbPath: receiptsDb });
-    const tradeId = `e2e_refund_${runId}`;
+    const tradeId = `e2e_refund_${refundRunId}`;
     store.upsertTrade(tradeId, {
       ln_payment_hash_hex: paymentHash2,
       sol_mint: mint.toBase58(),
@@ -504,7 +515,7 @@ test('e2e: LN<->Solana escrow flows', async (t) => {
       state: 'escrowed',
     });
     store.close();
-    const keypairPath = path.join(repoRoot, `onchain/solana/keypairs/e2e-swaprecover-refund-${runId}.json`);
+    const keypairPath = path.join(repoRoot, `onchain/solana/keypairs/e2e-swaprecover-refund-${refundRunId}.json`);
     fs.mkdirSync(path.dirname(keypairPath), { recursive: true });
     fs.writeFileSync(keypairPath, `${JSON.stringify(Array.from(solAlice.secretKey))}\n`, { mode: 0o600 });
 
@@ -536,8 +547,8 @@ test('e2e: LN<->Solana escrow flows', async (t) => {
   });
 
   await t.test('swaprecover claim: operator can claim from receipts with preimage', async () => {
-    const runId = crypto.randomBytes(4).toString('hex');
-    const invoiceLabel = `swaprecover_claim_${runId}`;
+    const claimRunId = crypto.randomBytes(4).toString('hex');
+    const invoiceLabel = `swaprecover_claim_${claimRunId}`;
     const invoice4 = await clnCli('cln-alice', ['invoice', '100000msat', invoiceLabel, 'swaprecover claim']);
     const paymentHash4 = parseHex32(invoice4.payment_hash, 'payment_hash');
     const bolt114 = invoice4.bolt11;
@@ -565,9 +576,9 @@ test('e2e: LN<->Solana escrow flows', async (t) => {
     const preimage4 = parseHex32(payRes4.payment_preimage, 'payment_preimage');
 
     // Persist a minimal receipt so the operator can claim deterministically.
-    const receiptsDb = path.join(repoRoot, `onchain/receipts/e2e-swaprecover-claim-${runId}.sqlite`);
+    const receiptsDb = path.join(repoRoot, `onchain/receipts/e2e-swaprecover-claim-${claimRunId}.sqlite`);
     const store = openTradeReceiptsStore({ dbPath: receiptsDb });
-    const tradeId = `e2e_claim_${runId}`;
+    const tradeId = `e2e_claim_${claimRunId}`;
     store.upsertTrade(tradeId, {
       ln_payment_hash_hex: paymentHash4,
       ln_preimage_hex: preimage4,
@@ -577,7 +588,7 @@ test('e2e: LN<->Solana escrow flows', async (t) => {
     });
     store.close();
 
-    const keypairPath = path.join(repoRoot, `onchain/solana/keypairs/e2e-swaprecover-claim-${runId}.json`);
+    const keypairPath = path.join(repoRoot, `onchain/solana/keypairs/e2e-swaprecover-claim-${claimRunId}.json`);
     fs.mkdirSync(path.dirname(keypairPath), { recursive: true });
     fs.writeFileSync(keypairPath, `${JSON.stringify(Array.from(solBob.secretKey))}\n`, { mode: 0o600 });
 
@@ -608,7 +619,7 @@ test('e2e: LN<->Solana escrow flows', async (t) => {
   });
 
   await t.test('negative: wrong preimage cannot claim', async () => {
-    const invoice3 = await clnCli('cln-alice', ['invoice', '100000msat', 'swap3', 'swap wrong preimage']);
+    const invoice3 = await clnCli('cln-alice', ['invoice', '100000msat', lnLabel('swap3'), 'swap wrong preimage']);
     const paymentHash3 = parseHex32(invoice3.payment_hash, 'payment_hash');
     const bolt113 = invoice3.bolt11;
 
@@ -671,7 +682,7 @@ test('e2e: LN<->Solana escrow flows', async (t) => {
   });
 
   await t.test('negative: wrong claimant cannot claim even with correct preimage', async () => {
-    const invoiceX = await clnCli('cln-alice', ['invoice', '100000msat', 'swapX', 'swap wrong claimant']);
+    const invoiceX = await clnCli('cln-alice', ['invoice', '100000msat', lnLabel('swapX'), 'swap wrong claimant']);
     const paymentHashX = parseHex32(invoiceX.payment_hash, 'payment_hash');
     const bolt11X = invoiceX.bolt11;
 
@@ -736,7 +747,7 @@ test('e2e: LN<->Solana escrow flows', async (t) => {
   });
 
   await t.test('negative: refund too early fails', async () => {
-    const invoice4 = await clnCli('cln-alice', ['invoice', '100000msat', 'swap4', 'swap early refund']);
+    const invoice4 = await clnCli('cln-alice', ['invoice', '100000msat', lnLabel('swap4'), 'swap early refund']);
     const paymentHash4 = parseHex32(invoice4.payment_hash, 'payment_hash');
 
     const now4 = Math.floor(Date.now() / 1000);
