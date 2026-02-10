@@ -793,7 +793,18 @@ function App() {
     const okChecklist = Boolean(preflight && typeof preflight === 'object');
     if (!okChecklist) reasons.push('checklist not run');
 
-    const okPeer = Boolean(preflight?.peer_status?.peers?.some?.((p: any) => Boolean(p?.alive)));
+    const scPort = (() => {
+      try {
+        const u = new URL(String(envInfo?.sc_bridge?.url || '').trim() || 'ws://127.0.0.1:49222');
+        const p = u.port ? Number.parseInt(u.port, 10) : 0;
+        return Number.isFinite(p) && p > 0 ? p : 49222;
+      } catch (_e) {
+        return 49222;
+      }
+    })();
+    const okPeer = Boolean(
+      preflight?.peer_status?.peers?.some?.((p: any) => Boolean(p?.alive) && Number(p?.sc_bridge?.port) === scPort)
+    );
     if (okChecklist && !okPeer) reasons.push('peer not running');
 
 		    // Treat "connecting" as ok for gating so the UI doesn't hard-block on transient feed reconnects.
@@ -830,11 +841,23 @@ function App() {
       okReceipts,
       okApp,
     };
-	  }, [health, preflight, scConnected, scConnecting, envInfo]);
+		  }, [health, preflight, scConnected, scConnecting, envInfo]);
 
   const stackAnyRunning = useMemo(() => {
     try {
-      const peerUp = Boolean(preflight?.peer_status?.peers?.some?.((p: any) => Boolean(p?.alive)));
+      const scPort = (() => {
+        try {
+          const u = new URL(String(envInfo?.sc_bridge?.url || '').trim() || 'ws://127.0.0.1:49222');
+          const p = u.port ? Number.parseInt(u.port, 10) : 0;
+          return Number.isFinite(p) && p > 0 ? p : 49222;
+        } catch (_e) {
+          return 49222;
+        }
+      })();
+      // Only consider the peer that matches *this* promptd instance (sc_bridge.url).
+      const peerUp = Boolean(
+        preflight?.peer_status?.peers?.some?.((p: any) => Boolean(p?.alive) && Number(p?.sc_bridge?.port) === scPort)
+      );
       const solUp = Boolean(preflight?.sol_local_status?.alive) || Boolean(preflight?.sol_local_status?.rpc_listening);
       const dockerUp = Array.isArray(preflight?.ln_docker_ps?.services) && preflight.ln_docker_ps.services.length > 0;
       const lnUp = Boolean(preflight?.ln_summary?.channels && Number(preflight.ln_summary.channels) > 0) || dockerUp;
@@ -842,7 +865,7 @@ function App() {
     } catch (_e) {
       return false;
     }
-  }, [preflight]);
+  }, [preflight, envInfo?.sc_bridge?.url]);
 
   async function fetchJson(path: string, init?: RequestInit) {
     const res = await fetch(path, {
@@ -2439,13 +2462,24 @@ function App() {
 
   // Auto-connect the sidechannel feed once a peer is up. The UI relies on this for RFQ/Offer inboxes.
   useEffect(() => {
-    const okPeer = Boolean(preflight?.peer_status?.peers?.some?.((p: any) => Boolean(p?.alive)));
+    const scPort = (() => {
+      try {
+        const u = new URL(String(envInfo?.sc_bridge?.url || '').trim() || 'ws://127.0.0.1:49222');
+        const p = u.port ? Number.parseInt(u.port, 10) : 0;
+        return Number.isFinite(p) && p > 0 ? p : 49222;
+      } catch (_e) {
+        return 49222;
+      }
+    })();
+    const okPeer = Boolean(
+      preflight?.peer_status?.peers?.some?.((p: any) => Boolean(p?.alive) && Number(p?.sc_bridge?.port) === scPort)
+    );
     if (!health?.ok || !okPeer) return;
     if (!scStreamWantedRef.current) return;
     if (scConnected || scConnecting) return;
     void startScStream();
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [health?.ok, preflight?.peer_status, scChannels]);
+  }, [health?.ok, preflight?.peer_status, scChannels, envInfo?.sc_bridge?.url]);
 
   // Lazy load tab-specific data.
   useEffect(() => {
