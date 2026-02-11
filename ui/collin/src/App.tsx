@@ -116,6 +116,19 @@ function extractLnOpenTxHint(out: any): { txid: string; channelPoint: string; sh
   return { txid, channelPoint, shortId };
 }
 
+function isLnWalletLockedError(raw: any): boolean {
+  const s = String(raw || '').trim().toLowerCase();
+  if (!s) return false;
+  return (
+    s.includes('wallet locked') ||
+    s.includes('wallet is locked') ||
+    s.includes('wallet encrypted and locked') ||
+    s.includes('unlock it to enable full rpc access') ||
+    s.includes('unlock wallet') ||
+    s.includes('must unlock wallet')
+  );
+}
+
 function parseToolSearchTokens(input: string): string[] {
   const s = String(input || '').trim().toLowerCase();
   if (!s) return [];
@@ -1225,6 +1238,34 @@ function App() {
   const autoQuotedRfqSigRef = useRef<Set<string>>(new Set());
   const autoInvitedAcceptSigRef = useRef<Set<string>>(new Set());
   const autoJoinedInviteSigRef = useRef<Set<string>>(new Set());
+  const autoAcceptLockedWarnedRef = useRef(false);
+
+  const lnWalletLocked = useMemo(() => {
+    const errs = [
+      preflight?.ln_info_error,
+      preflight?.ln_listfunds_error,
+      preflight?.ln_listpeers_error,
+      preflight?.ln_docker_ps_error,
+      lnFundingAddrErr,
+    ];
+    return errs.some((e) => isLnWalletLockedError(e));
+  }, [preflight?.ln_info_error, preflight?.ln_listfunds_error, preflight?.ln_listpeers_error, preflight?.ln_docker_ps_error, lnFundingAddrErr]);
+
+  const lnWalletLockedMessage = useMemo(() => {
+    const errs = [
+      preflight?.ln_info_error,
+      preflight?.ln_listfunds_error,
+      preflight?.ln_listpeers_error,
+      preflight?.ln_docker_ps_error,
+      lnFundingAddrErr,
+    ];
+    for (const e of errs) {
+      if (isLnWalletLockedError(e)) {
+        return String(e || '').trim();
+      }
+    }
+    return '';
+  }, [preflight?.ln_info_error, preflight?.ln_listfunds_error, preflight?.ln_listpeers_error, preflight?.ln_docker_ps_error, lnFundingAddrErr]);
 
   // Auto-hygiene:
   // - If a swap invite expires OR the trade hits a terminal state (claimed/refunded/canceled),
@@ -1361,6 +1402,14 @@ function App() {
 
   useEffect(() => {
     if (!health?.ok || !autoAcceptQuotes) return;
+    if (lnWalletLocked) {
+      if (!autoAcceptLockedWarnedRef.current) {
+        autoAcceptLockedWarnedRef.current = true;
+        pushToast('info', 'Auto-accept paused: Lightning wallet is locked. Unlock it, then refresh BTC status.');
+      }
+      return;
+    }
+    autoAcceptLockedWarnedRef.current = false;
     let cancelled = false;
     void (async () => {
       const queue = [...quoteEvents].reverse();
@@ -1382,7 +1431,7 @@ function App() {
       cancelled = true;
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [health?.ok, autoAcceptQuotes, quoteEvents, lnLiquidityMode]);
+  }, [health?.ok, autoAcceptQuotes, quoteEvents, lnLiquidityMode, lnWalletLocked]);
 
   useEffect(() => {
     if (!health?.ok || !autoInviteFromAccepts) return;
@@ -1953,10 +2002,12 @@ function App() {
 		    const okStream = Boolean(scConnected || scConnecting);
 		    if (okChecklist && !okStream) reasons.push('sc/stream not connected');
 
-    const okLn =
-      Boolean(preflight?.ln_summary?.channels_active && Number(preflight.ln_summary.channels_active) > 0) &&
-      !preflight?.ln_listfunds_error;
-    if (okChecklist && !okLn) reasons.push('Lightning not ready (no channels)');
+    const okLnChannels = Boolean(preflight?.ln_summary?.channels_active && Number(preflight.ln_summary.channels_active) > 0);
+    const okLn = okLnChannels && !preflight?.ln_listfunds_error && !lnWalletLocked;
+    if (okChecklist && !okLn) {
+      if (lnWalletLocked) reasons.push('Lightning wallet locked (unlock required)');
+      else reasons.push('Lightning not ready (no channels)');
+    }
 
     const solKind = String(preflight?.env?.solana?.classify?.kind || envInfo?.solana?.classify?.kind || '');
     const okSolRpc = solKind !== 'local' || Boolean(preflight?.sol_local_status?.rpc_listening);
@@ -1984,12 +2035,13 @@ function App() {
       okPeer,
       okStream,
       okLn,
+      lnWalletLocked,
       okSol,
       okReceipts,
       okApp,
       invitePolicyWarning,
     };
-		  }, [health, preflight, scConnected, scConnecting, envInfo, invitePolicy.missingTrustedInviters]);
+			  }, [health, preflight, scConnected, scConnecting, envInfo, invitePolicy.missingTrustedInviters, lnWalletLocked]);
 
   const stackAnyRunning = useMemo(() => {
     try {
@@ -2322,6 +2374,30 @@ function App() {
       pushToast('success', 'Solana local validator ready');
     }
     void refreshPreflight();
+  }
+
+  async function unlockLnWallet() {
+    const impl = String(envInfo?.ln?.impl || '').trim().toLowerCase();
+    const backend = String(envInfo?.ln?.backend || '').trim().toLowerCase();
+    if (impl !== 'lnd' || backend !== 'docker') {
+      pushToast('error', 'Unlock helper supports LND+docker only. Unlock your LN wallet in backend, then refresh BTC.');
+      return;
+    }
+    if (runBusy || stackOpBusy) return;
+    const ok =
+      autoApprove ||
+      window.confirm(
+        'Unlock Lightning wallet now?\n\nThis uses the configured password file under onchain/lnd/<network>/*.wallet-password.txt.'
+      );
+    if (!ok) return;
+    try {
+      await runToolFinal('intercomswap_ln_unlock', {}, { auto_approve: true });
+      setLnFundingAddrErr(null);
+      pushToast('success', 'Lightning wallet unlocked');
+      await refreshPreflight();
+    } catch (err: any) {
+      pushToast('error', err?.message || String(err));
+    }
   }
 
   function ensureLnLiquidityForLines({
@@ -4080,17 +4156,18 @@ function App() {
     String(walletUsdtAtomic || '').trim() ||
     '';
   const lnImpl = String((preflight as any)?.env?.ln?.impl || (preflight as any)?.ln_info?.implementation || envInfo?.ln?.impl || '').trim().toLowerCase();
+	  const lnBackend = String(envInfo?.ln?.backend || '');
   const lnRebalanceSupported = lnImpl === 'lnd';
   const lnRebalanceMinChannelsOk = lnChannelCount >= 2;
   const lnSpliceBackendSupported = lnImpl === 'cln';
-	  const lnBackend = String(envInfo?.ln?.backend || '');
+  const lnUnlockHelperSupported = lnImpl === 'lnd' && lnBackend === 'docker';
 	  const lnNetwork = String(envInfo?.ln?.network || '');
 	  const isLnRegtestDocker = lnBackend === 'docker' && lnNetwork === 'regtest';
   const solKind = String(preflight?.env?.solana?.classify?.kind || envInfo?.solana?.classify?.kind || '');
   const solLocalUp = solKind !== 'local' || Boolean(preflight?.sol_local_status?.rpc_listening);
   const solConfigOk = !preflight?.sol_config_error;
 	  const needSolLocalStart = solKind === 'local' && !solLocalUp;
-	  const needLnBootstrap = isLnRegtestDocker && (lnChannelCount < 1 || Boolean(preflight?.ln_listfunds_error));
+	  const needLnBootstrap = isLnRegtestDocker && !lnWalletLocked && (lnChannelCount < 1 || Boolean(preflight?.ln_listfunds_error));
 	  const autopostJobs = Array.isArray((preflight as any)?.autopost?.jobs) ? (preflight as any).autopost.jobs : [];
 	  const offerAutopostJobs = autopostJobs.filter((j: any) => String(j?.tool || '') === 'intercomswap_offer_post');
 	  const rfqAutopostJobs = autopostJobs.filter((j: any) => String(j?.tool || '') === 'intercomswap_rfq_post');
@@ -4249,18 +4326,32 @@ function App() {
                 </div>
               ) : null}
 
-	              {!stackGate.ok ? (
-	                <div className="alert warn">
-	                  <b>Trading setup incomplete.</b> Complete these items to enable trading:
-	                  <div className="muted small" style={{ marginTop: 6, whiteSpace: 'pre-wrap' }}>
-	                    {stackGate.reasons.length > 0 ? stackGate.reasons.map((r) => `- ${r}`).join('\n') : '- unknown'}
-	                  </div>
-	                </div>
-	              ) : (
-	                <div className="alert">
-	                  <span className="chip hi">READY</span> You can post Offers (Sell USDT) and RFQs (Sell BTC).
-	                </div>
-	              )}
+		              {!stackGate.ok ? (
+		                <div className="alert warn">
+		                  <b>Trading setup incomplete.</b> Complete these items to enable trading:
+		                  <div className="muted small" style={{ marginTop: 6, whiteSpace: 'pre-wrap' }}>
+		                    {stackGate.reasons.length > 0 ? stackGate.reasons.map((r) => `- ${r}`).join('\n') : '- unknown'}
+		                  </div>
+		                </div>
+		              ) : (
+		                <div className="alert">
+		                  <span className="chip hi">READY</span> You can post Offers (Sell USDT) and RFQs (Sell BTC).
+		                </div>
+		              )}
+
+              {lnWalletLocked ? (
+                <div className="alert warn">
+                  <b>Lightning wallet is locked.</b> Unlock the wallet in your LN backend, then press <span className="mono">Refresh BTC</span> in Wallets.
+                  {lnWalletLockedMessage ? <div className="muted small" style={{ marginTop: 6 }}>{lnWalletLockedMessage}</div> : null}
+                  {lnUnlockHelperSupported ? (
+                    <div className="row" style={{ marginTop: 8 }}>
+                      <button className="btn primary" onClick={() => void unlockLnWallet()} disabled={runBusy || stackOpBusy}>
+                        Unlock LN wallet
+                      </button>
+                    </div>
+                  ) : null}
+                </div>
+              ) : null}
 
               {!stackGate.ok && stackAnyRunning ? (
                 <div className="row">
@@ -6050,18 +6141,32 @@ function App() {
                 node: <span className="mono">{lnAlias || '—'}</span> · id:{' '}
                 <span className="mono">{lnNodeIdShort || '—'}</span>
               </div>
-		              <div className="row">
-			                {lnChannelCount > 0 ? <span className="chip hi">{lnChannelCount} channel(s)</span> : <span className="chip warn">no channels</span>}
-			                {lnWalletSats !== null ? (
+			              <div className="row">
+				                {lnChannelCount > 0 ? <span className="chip hi">{lnChannelCount} channel(s)</span> : <span className="chip warn">no channels</span>}
+				                {lnWalletSats !== null ? (
 			                  <span className="chip">
 			                    {satsToBtcDisplay(lnWalletSats)} BTC ({lnWalletSats} sats)
 			                    {oracle.btc_usd ? ` ≈ ${fmtUsd((lnWalletSats / 1e8) * oracle.btc_usd)}` : ''}
 			                  </span>
 			                ) : null}
-		                <button className="btn small" onClick={() => void refreshPreflight()} disabled={preflightBusy}>
-		                  Refresh BTC
-		                </button>
-		              </div>
+			                <button className="btn small" onClick={() => void refreshPreflight()} disabled={preflightBusy}>
+			                  Refresh BTC
+			                </button>
+			              </div>
+
+                  {lnWalletLocked ? (
+                    <div className="alert warn" style={{ marginTop: 8 }}>
+                      <b>Lightning wallet locked.</b> Unlock the LN wallet first; channel operations and auto-settlement are paused.
+                      {lnWalletLockedMessage ? <div className="muted small" style={{ marginTop: 6 }}>{lnWalletLockedMessage}</div> : null}
+                      {lnUnlockHelperSupported ? (
+                        <div className="row" style={{ marginTop: 8 }}>
+                          <button className="btn primary" onClick={() => void unlockLnWallet()} disabled={runBusy || stackOpBusy}>
+                            Unlock LN wallet
+                          </button>
+                        </div>
+                      ) : null}
+                    </div>
+                  ) : null}
 
 		              {isLnRegtestDocker ? (
 		                <button
@@ -6330,12 +6435,16 @@ function App() {
                     />
                     private channel
                   </label>
-                  <button
-                    className="btn primary"
-                    disabled={runBusy || !lnPeerInput.trim() || !Number.isInteger(lnChannelAmountSats) || Number(lnChannelAmountSats) <= 0}
-                    onClick={async () => {
-                      const peer = lnPeerInput.trim();
-                      const m = peer.match(/^([0-9a-fA-F]{66})@/);
+	                  <button
+	                    className="btn primary"
+	                    disabled={runBusy || lnWalletLocked || !lnPeerInput.trim() || !Number.isInteger(lnChannelAmountSats) || Number(lnChannelAmountSats) <= 0}
+	                    onClick={async () => {
+                        if (lnWalletLocked) {
+                          pushToast('error', 'Lightning wallet locked. Unlock it first, then refresh BTC status.');
+                          return;
+                        }
+	                      const peer = lnPeerInput.trim();
+	                      const m = peer.match(/^([0-9a-fA-F]{66})@/);
                       if (!m) {
                         pushToast('error', 'Peer URI must be nodeid@host:port');
                         return;
@@ -6409,13 +6518,18 @@ function App() {
                           ? 'LND supports explicit self-payment; route outcome still depends on available channels.'
                           : `Current LN impl is ${lnImpl || 'unknown'}; self-pay rebalance requires LND.`}
                       </div>
-                      {!lnRebalanceMinChannelsOk ? (
+	                      {!lnRebalanceMinChannelsOk ? (
+	                        <div className="alert warn" style={{ marginTop: 8 }}>
+	                          <b>Likely no route.</b> Self-pay rebalance usually needs at least <span className="mono">2 active channels</span>{' '}
+	                          to form a circular route. Current active/known channels: <span className="mono">{lnChannelCount}</span>.
+	                        </div>
+	                      ) : null}
+                      {lnWalletLocked ? (
                         <div className="alert warn" style={{ marginTop: 8 }}>
-                          <b>Likely no route.</b> Self-pay rebalance usually needs at least <span className="mono">2 active channels</span>{' '}
-                          to form a circular route. Current active/known channels: <span className="mono">{lnChannelCount}</span>.
+                          <b>Wallet locked.</b> Self-pay rebalance requires an unlocked Lightning wallet.
                         </div>
                       ) : null}
-                      <div className="gridform" style={{ marginTop: 8 }}>
+	                      <div className="gridform" style={{ marginTop: 8 }}>
                         <div className="field">
                           <div className="field-hd">
                             <span className="mono">amount</span>
@@ -6470,15 +6584,20 @@ function App() {
                       <div className="row" style={{ marginTop: 8 }}>
                         <button
                           className="btn primary"
-                          disabled={
-                            runBusy ||
-                            !lnRebalanceSupported ||
-                            lnChannelCount < 1 ||
-                            !Number.isInteger(lnRebalanceAmountSats) ||
-                            Number(lnRebalanceAmountSats) <= 0
-                          }
-                          onClick={async () => {
-                            const amount_sats = Number(lnRebalanceAmountSats || 0);
+	                          disabled={
+	                            runBusy ||
+                            lnWalletLocked ||
+	                            !lnRebalanceSupported ||
+	                            lnChannelCount < 1 ||
+	                            !Number.isInteger(lnRebalanceAmountSats) ||
+	                            Number(lnRebalanceAmountSats) <= 0
+	                          }
+	                          onClick={async () => {
+                            if (lnWalletLocked) {
+                              pushToast('error', 'Lightning wallet locked. Unlock it first, then refresh BTC status.');
+                              return;
+                            }
+	                            const amount_sats = Number(lnRebalanceAmountSats || 0);
                             const fee_limit_sat = Number(lnRebalanceFeeLimitSat || 0);
                             const outgoing_chan_id = String(lnRebalanceOutgoingChanId || '').trim();
                             if (toolRequiresApproval('intercomswap_ln_rebalance_selfpay') && !autoApprove) {
