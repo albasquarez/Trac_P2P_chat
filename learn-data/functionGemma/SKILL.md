@@ -15,20 +15,26 @@ This skill defines a repeatable way to:
 This document is structural and technology-agnostic. It describes patterns, constraints, and interfaces, not one specific ML vendor or runtime.
 
 ## Current Artifacts In This Folder
-- `intercomswap-tools-finetune.jsonl`
-  - Tool-schema-grounding dataset across all exposed tools.
-- `intercomswap-intent-routing-finetune.jsonl`
-  - Trade intent routing dataset (buy/sell mapping, conversion, retries).
-- `intercomswap-ops-intent-routing-finetune.jsonl`
-  - Non-trade intent routing dataset (stack, peer, channels, LN, Solana, receipts, recovery).
 - `generate-phase2-datasets.mjs`
   - Deterministic expansion/splitting script.
-- `intercomswap-finetune-train-v2.jsonl`
-  - Phase-2 train split.
-- `intercomswap-finetune-eval-v2.jsonl`
-  - Phase-2 held-out eval split.
-- `intercomswap-finetune-manifest-v2.json`
-  - Counts, scenario distribution, failure ratio, split info.
+- `training-corpus.zip`
+  - Compressed corpus bundle containing:
+    - `intercomswap-tools-finetune.jsonl`
+    - `intercomswap-intent-routing-finetune.jsonl`
+    - `intercomswap-ops-intent-routing-finetune.jsonl`
+    - `intercomswap-finetune-train-v2.jsonl`
+    - `intercomswap-finetune-eval-v2.jsonl`
+    - `intercomswap-finetune-manifest-v2.json`
+- `SKILL.md`
+  - This skill and workflow reference.
+
+## Unpack Step (Required)
+Before using datasets for training or evaluation, unzip the corpus in this folder:
+
+```bash
+cd learn-data/functionGemma
+unzip -o training-corpus.zip
+```
 
 ## Phases
 
@@ -211,4 +217,3 @@ Before training on a fork:
 - Keep datasets deterministic and reproducible.
 - Keep eval split held-out and immutable per version.
 - Version your manifests so training runs can be audited and compared.
-
