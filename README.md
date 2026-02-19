@@ -3,6 +3,9 @@
 > A fork of [Trac-Systems/intercom-swap](https://github.com/TracSystems/intercom-swap) that adds a real-time AI assistant (Claude) embedded directly into the Intercom sidechannel UI — making P2P communication smarter and more capable.
 
 ---
+![aiagent2jpg](https://github.com/user-attachments/assets/d7b80649-c69d-4dd1-b316-4117eb8d403b)
+![aiagent](https://github.com/user-attachments/assets/0169f60d-e4d7-472e-a3f2-c30532636ba7)
+
 
 ## 🔑 TRAC ADDRESS
 
